@@ -1,0 +1,16 @@
+﻿target/
+bin/
+*.class
+*.jar
+*.war
+!mvnw
+.mvn/wrapper/maven-wrapper.jar
+.env
+.idea/
+*.iml
+*.iws
+*.ipr
+.DS_Store
+*.pid
+hs_err_pid*.log
+replay_pid*.log
