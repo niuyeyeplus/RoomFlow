@@ -10,6 +10,9 @@ COPY backend/pom.xml ./
 COPY backend/src ./src
 
 # Ensure the wrapper is executable and build the jar (tests run in CI)
+# Unset MAVEN_CONFIG: the base image sets it to /root/.m2 which the Maven
+# wrapper misinterprets as a lifecycle phase ("Unknown lifecycle phase /root/.m2")
+ENV MAVEN_CONFIG=""
 RUN chmod +x ./mvnw && \
     ./mvnw -B -DskipTests=true package
 
