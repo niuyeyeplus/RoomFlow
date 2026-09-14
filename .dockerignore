@@ -1,0 +1,42 @@
+# Git / local configuration
+.git/
+.gitignore
+.env
+.env.*
+*.env
+**/.env
+**/*.env
+!.env.example
+
+# Documentation
+docs/
+PLAN.md
+AGENTS.md
+CONVENTIONS.md
+README.md
+
+# Backend build artifacts
+backend/target/
+backend/.mvn/timing.properties
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+.cache/
+
+# Devin session artifacts
+.devin/cache/
+.devin/logs/
