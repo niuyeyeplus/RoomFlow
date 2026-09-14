@@ -1,0 +1,32 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Java / Maven
+target/
+.mvn/timing.properties
+
+# Node / Vue
+node_modules/
+dist/
+.vite/
+coverage/
+
+# IDE and OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs and local runtime data
+*.log
+logs/
+.cache/
+
+# Devin local session artifacts
+.devin/cache/
+.devin/logs/
