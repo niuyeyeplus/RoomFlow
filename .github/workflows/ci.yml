@@ -106,30 +106,72 @@ jobs:
           /tmp/gitleaks detect --redact --report-format=sarif --report-path=gitleaks-results.sarif --log-level=info
           echo "Gitleaks scan completed - no leaks found"
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - name: Upload Gitleaks SARIF report
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          distribution: 'temurin'
-          java-version: '21'
-          cache: 'maven'
-          cache-dependency-path: 'backend/pom.xml'
+          name: gitleaks-sarif-report
+          path: gitleaks-results.sarif
+          if-no-files-found: warn
 
-      - name: Backend dependency vulnerability scan
-        working-directory: backend
-        env:
-          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-        timeout-minutes: 60
+      - name: Download and verify OpenSCA-cli v3.0.11
         run: |
-          chmod +x ./mvnw
-          ./mvnw -B dependency:resolve
-          if [ -n "$NVD_API_KEY" ]; then
-            echo "Running OWASP dependency-check with NVD API key"
-            ./mvnw -B org.owasp:dependency-check-maven:11.1.1:check -DfailBuildOnCVSS=9 -DnvdApiKey="$NVD_API_KEY"
-          else
-            echo "::warning::NVD_API_KEY secret is not set. Skipping OWASP dependency-check."
-            echo "::warning::Configure NVD_API_KEY in GitHub Secrets to enable backend vulnerability scanning."
-            echo "::warning::Without an API key, NVD rate limiting (1 req/6s) makes the scan timeout."
+          set -e
+          OPENSCA_VERSION="v3.0.11"
+          OPENSCA_TARBALL="opensca-cli-${OPENSCA_VERSION}-linux-amd64.tar.gz"
+          OPENSCA_URL="https://github.com/XmirrorSecurity/OpenSCA-cli/releases/download/${OPENSCA_VERSION}/${OPENSCA_TARBALL}"
+          OPENSCA_SHA256="69eb3924a01340825643ea5ad6e3bff2fc1e76830cbe9dbb35a28fd842eed65b"
+
+          curl -sSL "${OPENSCA_URL}" -o "${OPENSCA_TARBALL}"
+          echo "${OPENSCA_SHA256}  ${OPENSCA_TARBALL}" | sha256sum -c -
+          tar xzf "${OPENSCA_TARBALL}"
+          chmod +x opensca-cli
+          echo "OpenSCA-cli ${OPENSCA_VERSION} downloaded and checksum verified"
+
+      - name: Run OpenSCA dependency scan
+        env:
+          OPENSCA_TOKEN: ${{ secrets.OPENSCA_TOKEN }}
+        run: |
+          set +e
+          OPENSCA_ARGS=(-path .)
+          if [ -n "$OPENSCA_TOKEN" ]; then
+            OPENSCA_ARGS+=(-token "$OPENSCA_TOKEN")
           fi
+
+          JSON_EXIT=0
+          SARIF_EXIT=0
+          ./opensca-cli "${OPENSCA_ARGS[@]}" -out opensca-report.json -log opensca-json.log || JSON_EXIT=$?
+          ./opensca-cli "${OPENSCA_ARGS[@]}" -out opensca-report.sarif -log opensca-sarif.log || SARIF_EXIT=$?
+
+          echo "OpenSCA json exit=${JSON_EXIT}, sarif exit=${SARIF_EXIT}"
+          if [ "${JSON_EXIT}" -ne 0 ] || [ "${SARIF_EXIT}" -ne 0 ]; then
+            echo "::error::OpenSCA found vulnerabilities (json=${JSON_EXIT}, sarif=${SARIF_EXIT}). See opensca-reports artifact."
+            exit 1
+          fi
+          echo "OpenSCA scan completed - no vulnerabilities found"
+
+      - name: Redact token from OpenSCA logs
+        if: always()
+        env:
+          OPENSCA_TOKEN: ${{ secrets.OPENSCA_TOKEN }}
+        run: |
+          for logfile in opensca-json.log opensca-sarif.log; do
+            if [ -f "$logfile" ]; then
+              if [ -n "$OPENSCA_TOKEN" ]; then
+                perl -i -pe "s/\Q$OPENSCA_TOKEN\E/***REDACTED***/g" "$logfile"
+              fi
+            fi
+          done
+
+      - name: Upload OpenSCA reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensca-reports
+          path: |
+            opensca-report.json
+            opensca-report.sarif
+          if-no-files-found: warn
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v4
