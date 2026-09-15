@@ -30,6 +30,7 @@ import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
@@ -116,6 +117,11 @@ class MeetingLifecycleIT extends AbstractContainersIT {
 
   /**
    * Inserts an ACTIVE meeting directly, bypassing the create-time rules (for past/started slots).
+   *
+   * <p>Times are truncated to whole seconds because {@code meeting.start_time/end_time} are
+   * DATETIME(fsp=0): MySQL rounds fractional seconds on insert, so a nanosecond-precision value
+   * could land up to ~1s later than intended and flip boundary comparisons against the execution
+   * clock. Truncating here keeps the in-memory value identical to the stored one.
    */
   private Meeting insertMeeting(
       Long roomId, Long organizerId, LocalDateTime start, LocalDateTime end) {
@@ -123,8 +129,8 @@ class MeetingLifecycleIT extends AbstractContainersIT {
     m.setTitle("生命周期IT会议");
     m.setRoomId(roomId);
     m.setOrganizerId(organizerId);
-    m.setStartTime(start);
-    m.setEndTime(end);
+    m.setStartTime(start.truncatedTo(ChronoUnit.SECONDS));
+    m.setEndTime(end.truncatedTo(ChronoUnit.SECONDS));
     m.setStatus(MeetingStatus.ACTIVE);
     m.setEndedEarly(false);
     meetingMapper.insert(m);
@@ -266,7 +272,10 @@ class MeetingLifecycleIT extends AbstractContainersIT {
         assertThrows(BizException.class, () -> meetingService.endEarly(future.getId(), admin));
     assertEquals(40909, e.getErrorCode().getCode());
 
-    // now == endTime belongs to the scheduler.
+    // now == endTime belongs to the scheduler. insertMeeting truncates to whole seconds, so the
+    // stored end_time is <= the execution-time now and the 40909 guard must fire. (The 500ms
+    // sweep may also flip the meeting to ENDED first — endEarly rejects that path with the same
+    // 40909, so both outcomes converge on this assertion.)
     Meeting atEnd = insertMeeting(roomId, admin.id(), now.minusHours(1), now);
     e = assertThrows(BizException.class, () -> meetingService.endEarly(atEnd.getId(), admin));
     assertEquals(40909, e.getErrorCode().getCode());
