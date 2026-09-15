@@ -1,0 +1,25 @@
+# Build output and artifacts
+dist/
+coverage/
+*.local
+test-results/
+playwright-report/
+
+# Dependencies and lockfiles
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Logs and temp files
+*.log
+*.tsbuildinfo
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Owned by the playwright agent - formatted in that scope, not here
+playwright.config.ts
+tests/e2e/

@@ -3,6 +3,25 @@ spring:
     name: roomflow
   profiles:
     active: ${SPRING_PROFILES_ACTIVE:dev}
+  autoconfigure:
+    exclude:
+      # Authentication is handled by the JWT filter; suppress the default in-memory
+      # user and its "generated security password" startup warning.
+      - org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+  jackson:
+    time-zone: Asia/Shanghai
+  data:
+    redis:
+      timeout: 5s
+  rabbitmq:
+    listener:
+      simple:
+        retry:
+          enabled: true
+          initial-interval: 1s
+          max-attempts: 3
+          multiplier: 2.0
+        default-requeue-rejected: false
 
 server:
   port: 8080

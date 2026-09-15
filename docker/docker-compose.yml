@@ -1,15 +1,41 @@
+# RoomFlow container stack (development / single-host deployment).
+#
+# Usage — always run from the REPOSITORY ROOT:
+#   cp .env.example .env   # then fill in all required secrets
+#   docker compose --project-directory . --env-file .env -f docker/docker-compose.yml up -d
+#
+# Why --project-directory/.env-file are required:
+#   Compose resolves ${VAR} interpolation from the shell environment and the
+#   .env file in the *project directory*, which defaults to the directory
+#   containing the first -f compose file (docker/). Running
+#   `docker compose -f docker/docker-compose.yml up` from the repo root makes
+#   Compose look for docker/.env — which does not exist — so ${DB_PASSWORD}
+#   etc. interpolate to empty strings and MySQL/Redis refuse to start.
+#   --project-directory . makes the repo root the project directory so the
+#   root .env is found; --env-file .env is explicit and fails fast with a
+#   clear error if .env is missing. See docker/README.md.
+#
+# NOTE: no `env_file:` directive is used. Every variable each service needs
+# is mapped explicitly in its `environment:` block below. env_file: ../.env
+# was removed because (a) it does NOT feed ${VAR} interpolation anyway, and
+# (b) a missing file is a hard error on Compose < v2.24 (which lacks the
+# `required: false` long syntax). Without env_file, a fresh clone only gets
+# "variable is not set" warnings instead of a file-not-found error.
+
 services:
   mysql:
     image: mysql:8.4
     container_name: roomflow-mysql
-    env_file: ../.env
+    restart: unless-stopped
     environment:
       MYSQL_DATABASE: ${DB_NAME:-roomflow}
       MYSQL_USER: ${DB_USERNAME:-roomflow}
       MYSQL_PASSWORD: ${DB_PASSWORD}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    # Bound to loopback only: middleware must not listen on 0.0.0.0.
+    # Reach it remotely via SSH tunnel (see docs/operations/middleware.md).
     ports:
-      - "13306:3306"
+      - "127.0.0.1:13306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
@@ -23,11 +49,18 @@ services:
   redis:
     image: redis:8.2-alpine
     container_name: roomflow-redis
+    restart: unless-stopped
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
-    command: redis-server --requirepass ${REDIS_PASSWORD}
+    # $$ escapes Compose interpolation: the container's own env is expanded
+    # by sh at runtime, so `docker inspect` shows the literal "$REDIS_PASSWORD"
+    # in Config.Cmd instead of the plaintext password.
+    # DEV-ONLY CAVEAT: the value is still present in the container's
+    # environment block (docker inspect .Config.Env) and in `ps` output.
+    # For production, inject via Docker secrets or redis.conf instead.
+    command: ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\""]
     ports:
-      - "16379:6379"
+      - "127.0.0.1:16379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -41,14 +74,16 @@ services:
   rabbitmq:
     image: rabbitmq:4.3-management
     container_name: roomflow-rabbitmq
-    env_file: ../.env
+    restart: unless-stopped
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
       RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-roomflow}
+    # Loopback-only: AMQP (15673->5672) and the management UI (15672) are
+    # dev-facing ports; access the management console via SSH tunnel.
     ports:
-      - "15673:5672"
-      - "15672:15672"
+      - "127.0.0.1:15673:5672"
+      - "127.0.0.1:15672:15672"
     healthcheck:
       test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
       interval: 10s
@@ -60,9 +95,9 @@ services:
   backend:
     image: ghcr.io/niuyeyeplus/roomflow-backend:${IMAGE_TAG:-latest}
     container_name: roomflow-backend
-    env_file: ../.env
+    restart: unless-stopped
     environment:
-      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-dev}
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:?must be set explicitly (dev|staging|prod)}
       DB_HOST: mysql
       DB_PORT: 3306
       DB_NAME: ${DB_NAME:-roomflow}
@@ -80,7 +115,7 @@ services:
       JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
       JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-30d}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       mysql:
         condition: service_healthy
@@ -88,16 +123,27 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+    # /actuator/health is permitAll in SecurityConfig. The runner image is
+    # eclipse-temurin:21-jre-alpine, which has no curl — use BusyBox wget
+    # (non-zero exit on HTTP error).
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     networks:
       - roomflow-net
 
   frontend:
     image: ghcr.io/niuyeyeplus/roomflow-frontend:${IMAGE_TAG:-latest}
     container_name: roomflow-frontend
+    restart: unless-stopped
     ports:
       - "80:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
       - roomflow-net
 

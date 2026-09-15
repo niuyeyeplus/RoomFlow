@@ -1,0 +1,2048 @@
+openapi: 3.0.3
+info:
+  title: RoomFlow API
+  version: 1.0.0
+  contact:
+    name: RoomFlow Team
+  description: |-
+    RoomFlow 会议室预约管理系统 REST API 契约（OpenAPI 3.0.3）。
+
+    本文件是前后端唯一共享契约：后端 Controller 与前端 api/types 均以此为准。
+    配套说明文档（错误码表、分页约定、权限矩阵、时区约定）见 `docs/api/README.md`。
+
+    通用约定：
+    - 统一响应体 `Result<T>`：`{code:int, message:string, data:T}`。`code=0` 成功；非 0 为业务错误码，同时携带匹配的 HTTP 状态码。
+    - 时间：全部时间字段（请求与响应）均为北京时间，ISO 8601 格式且必须显式携带 `+08:00` 偏移，例：`2026-09-16T14:00:00+08:00`。`format: date` 的查询参数为北京时间日历日 `YYYY-MM-DD`。
+    - 会议时段为 `[startTime, endTime)` 半开区间；同一房间的相邻时段允许首尾相接（前一会的 endTime 可等于后一会的 startTime）。
+    - 时间规则：`startTime` 不得早于当前时间、不得晚于当前时间 +72h（滚动窗口只约束开始时间）；`startTime` 与 `endTime` 均须按 15 分钟对齐（秒=0 且分钟 %15=0）；时长为 15min–24h（含两端）；允许跨天；`endTime` 可超出 72h 预约窗口。
+    - 权限：每个端点以 `x-permission` 标注，取值 `PUBLIC`（无需登录）/ `REFRESH_TOKEN`（仅凭请求体中的 Refresh Token）/ `AUTHENTICATED`（任意已登录用户）/ `ADMIN` / `ORGANIZER_OR_ADMIN`（会议发起人或管理员）/ `SELF`（仅操作本人资源）。全局默认要求 Bearer JWT；公开端点显式声明 `security: []`。
+    - 每个端点可能返回的业务错误码以 `x-error-codes` 枚举，与 README 错误码表一一对应。
+    - 分页：`page`（从 1 起）/ `size`（默认 10，最大 100），分页响应为 `PageResult<T> = {records, total, page, size}`。
+servers:
+  - url: http://localhost:8080
+    description: 本地开发环境
+tags:
+  - name: auth
+    description: 认证：注册 / 登录 / 退出 / 刷新 / 当前用户
+  - name: rooms
+    description: 会议室：查询与 ADMIN 管理
+  - name: meetings
+    description: 会议：创建 / 查询 / 修改 / 取消 / 删除 / 提前结束
+  - name: participants
+    description: 报名：报名 / 退出 / 踢人 / 参会者查询
+  - name: notifications
+    description: 站内通知：查询 / 标记已读
+security:
+  - bearerAuth: []
+paths:
+  /api/auth/register:
+    post:
+      tags:
+        - auth
+      operationId: register
+      summary: 用户注册
+      description: |-
+        用户名 + 密码注册。用户名全局唯一（不区分大小写与否由服务端统一存储决定，契约要求按原样唯一）。
+        注册成功即视为登录，直接返回 Access Token 与 Refresh Token。
+        冲突时返回 409 + code=40901。
+      security: []
+      x-permission: PUBLIC
+      x-error-codes: [40001, 40002, 40901, 50000]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: 注册成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultAuthTokenVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  tokenType: Bearer
+                  accessToken: <ACCESS_TOKEN>
+                  accessTokenExpiresIn: 1800
+                  refreshToken: <REFRESH_TOKEN>
+                  refreshTokenExpiresIn: 2592000
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/auth/login:
+    post:
+      tags:
+        - auth
+      operationId: login
+      summary: 用户登录
+      description: |-
+        用户名 + 密码登录，返回 Access Token 与 Refresh Token。
+        用户名或密码错误统一返回 401 + code=40103（不区分是用户名不存在还是密码错误，防止枚举）。
+        账号被禁用（status=0）返回 403 + code=40302。
+      security: []
+      x-permission: PUBLIC
+      x-error-codes: [40001, 40002, 40103, 40302, 50000]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultAuthTokenVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  tokenType: Bearer
+                  accessToken: <ACCESS_TOKEN>
+                  accessTokenExpiresIn: 1800
+                  refreshToken: <REFRESH_TOKEN>
+                  refreshTokenExpiresIn: 2592000
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/auth/logout:
+    post:
+      tags:
+        - auth
+      operationId: logout
+      summary: 退出登录
+      description: |-
+        退出当前会话：撤销当前 Access Token 对应的会话及其 Refresh Token（服务端会话存储中删除）。
+        无请求体。幂等：对同一 Token 重复退出仍返回 200（Token 已撤销按未认证处理时为 401）。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40101, 40102, 50000]
+      responses:
+        '200':
+          description: 退出成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultVoid'
+              example:
+                code: 0
+                message: success
+                data: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/auth/refresh:
+    post:
+      tags:
+        - auth
+      operationId: refreshToken
+      summary: 刷新 Token
+      description: |-
+        使用请求体中的 Refresh Token 换取新的 Token 对（Refresh Token 轮换：旧 Refresh Token 立即失效）。
+        本端点不使用 Bearer 头认证，凭证为请求体中的 refreshToken。
+        Refresh Token 无效、已撤销或已过期返回 401 + code=40104。
+      security: []
+      x-permission: REFRESH_TOKEN
+      x-error-codes: [40001, 40002, 40104, 50000]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: 刷新成功，返回新 Token 对
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultAuthTokenVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  tokenType: Bearer
+                  accessToken: <ACCESS_TOKEN>
+                  accessTokenExpiresIn: 1800
+                  refreshToken: <ROTATED_REFRESH_TOKEN>
+                  refreshTokenExpiresIn: 2592000
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/auth/me:
+    get:
+      tags:
+        - auth
+      operationId: getCurrentAccount
+      summary: 当前登录用户信息
+      description: 返回当前 Bearer Token 对应的账号信息（脱敏，不含 password_hash）。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40101, 40102, 50000]
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultAccountVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 1001
+                  username: alice
+                  role: USER
+                  status: 1
+                  createdAt: '2026-09-15T10:00:00+08:00'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/rooms:
+    get:
+      tags:
+        - rooms
+      operationId: listRooms
+      summary: 会议室列表
+      description: |-
+        返回全部会议室（含已停用），按 id 升序，不分页（房间是少量有限资源）。
+        可选 `enabled` 筛选启用状态；缺省返回全部。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40001, 40101, 40102, 50000]
+      parameters:
+        - name: enabled
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: 按启用状态筛选；true=仅启用，false=仅停用，缺省=全部
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultRoomVOList'
+              example:
+                code: 0
+                message: success
+                data:
+                  - id: 1
+                    name: 301会议室
+                    location: 3楼东侧
+                    capacity: 8
+                    equipment: [PROJECTOR, WHITEBOARD]
+                    enabled: true
+                    createdAt: '2026-09-15T09:00:00+08:00'
+                    updatedAt: '2026-09-15T09:00:00+08:00'
+                  - id: 2
+                    name: 302会议室
+                    location: 3楼西侧
+                    capacity: 12
+                    equipment: [PROJECTOR, VIDEO_CONFERENCE]
+                    enabled: true
+                    createdAt: '2026-09-15T09:00:00+08:00'
+                    updatedAt: '2026-09-15T09:00:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - rooms
+      operationId: createRoom
+      summary: 创建会议室
+      description: 创建会议室，enabled 默认为 true。仅 ADMIN。
+      x-permission: ADMIN
+      x-error-codes: [40001, 40002, 40101, 40102, 40301, 50000]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoomRequest'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultRoomVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 4
+                  name: 多功能厅B
+                  location: 5楼
+                  capacity: 20
+                  equipment: [PROJECTOR, WHITEBOARD, VIDEO_CONFERENCE, PHONE]
+                  enabled: true
+                  createdAt: '2026-09-15T14:00:00+08:00'
+                  updatedAt: '2026-09-15T14:00:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/rooms/{id}:
+    get:
+      tags:
+        - rooms
+      operationId: getRoom
+      summary: 会议室详情
+      description: 按 ID 查询会议室（含已停用房间）。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40001, 40101, 40102, 40401, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultRoomVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 1
+                  name: 301会议室
+                  location: 3楼东侧
+                  capacity: 8
+                  equipment: [PROJECTOR, WHITEBOARD]
+                  enabled: true
+                  createdAt: '2026-09-15T09:00:00+08:00'
+                  updatedAt: '2026-09-15T09:00:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      tags:
+        - rooms
+      operationId: updateRoom
+      summary: 修改会议室
+      description: |-
+        全量更新会议室信息（PUT 语义）。仅 ADMIN。
+        location、equipment 省略时分别视为 null、空数组。
+        注意：本端点不修改 enabled，启停请使用 PATCH /api/rooms/{id}/status。
+      x-permission: ADMIN
+      x-error-codes: [40001, 40002, 40101, 40102, 40301, 40401, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRoomRequest'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultRoomVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 1
+                  name: 301会议室（翻新版）
+                  location: 3楼东侧
+                  capacity: 10
+                  equipment: [PROJECTOR, WHITEBOARD, PHONE]
+                  enabled: true
+                  createdAt: '2026-09-15T09:00:00+08:00'
+                  updatedAt: '2026-09-15T15:00:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags:
+        - rooms
+      operationId: deleteRoom
+      summary: 停用会议室（软删除）
+      description: |-
+        软删除会议室：将 enabled 置为 false，不物理删除行，保留历史会议的 room_id 关联完整性。
+        停用时校验：若该房间存在 status=ACTIVE 的未结束会议，拒绝并返回 409 + code=40907，需先处理相关会议。
+        幂等：对已停用房间重复调用返回 200。仅 ADMIN。
+      x-permission: ADMIN
+      x-error-codes: [40001, 40101, 40102, 40301, 40401, 40907, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: 停用成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultVoid'
+              example:
+                code: 0
+                message: success
+                data: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/rooms/{id}/status:
+    patch:
+      tags:
+        - rooms
+      operationId: updateRoomStatus
+      summary: 启用 / 停用会议室
+      description: |-
+        设置 enabled 标志。仅 ADMIN。
+        enabled=false（停用）时校验：存在 status=ACTIVE 的未结束会议则拒绝（409 + code=40907）。
+        enabled=true（启用）无附加校验。
+      x-permission: ADMIN
+      x-error-codes: [40001, 40002, 40101, 40102, 40301, 40401, 40907, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomStatusRequest'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultRoomVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 1
+                  name: 301会议室
+                  location: 3楼东侧
+                  capacity: 8
+                  equipment: [PROJECTOR, WHITEBOARD]
+                  enabled: false
+                  createdAt: '2026-09-15T09:00:00+08:00'
+                  updatedAt: '2026-09-15T16:00:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/rooms/{id}/availability:
+    get:
+      tags:
+        - rooms
+      operationId: getRoomAvailability
+      summary: 查询房间占用时段
+      description: |-
+        返回指定房间在指定北京时间日历日范围内、与范围有交集的全部 status=ACTIVE 会议占用时段
+        （`occupiedSlots`，按 startTime 升序），由前端用“日期范围 − 占用时段”计算空闲时段。
+        设计理由：只暴露已占用时段这一事实数据，空闲区间的生成规则（粒度、边界）由前端决定，
+        避免前后端对“空闲段”边界定义不一致。
+        已停用房间（enabled=false）仍可查询其占用时段（历史会议保留关联）。
+        缺少必填查询参数 startDate 时返回 400 + code=40002。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40001, 40002, 40101, 40102, 40401, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+        - name: startDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+          description: 范围起始日，北京时间日历日 YYYY-MM-DD
+          example: '2026-09-16'
+        - name: endDate
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+          description: 范围结束日（含），北京时间日历日；缺省=startDate；不得早于 startDate 且跨度 ≤ 7 天，否则 40001
+          example: '2026-09-16'
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultRoomAvailabilityVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  roomId: 1
+                  startDate: '2026-09-16'
+                  endDate: '2026-09-16'
+                  occupiedSlots:
+                    - meetingId: 101
+                      startTime: '2026-09-16T10:00:00+08:00'
+                      endTime: '2026-09-16T11:30:00+08:00'
+                    - meetingId: 102
+                      startTime: '2026-09-16T14:00:00+08:00'
+                      endTime: '2026-09-16T15:00:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/meetings:
+    get:
+      tags:
+        - meetings
+      operationId: listMeetings
+      summary: 会议列表
+      description: |-
+        分页查询会议列表，按 startTime DESC、id DESC 排序。
+        任何情况下都不返回 status=DELETED 的会议（对普通用户与 ADMIN 均不可见）。
+        筛选参数可组合：
+        - roomId：按房间筛选；
+        - date：返回与该北京时间日历日有交集的会议（含跨天会议）；
+        - status：按 ACTIVE/ENDED/CANCELLED 筛选（不可筛选 DELETED）；
+        - onlyMine=true：仅返回“当前用户为发起人，或当前用户存在有效参会记录（leftAt 为 null）”的会议。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40001, 40101, 40102, 50000]
+      parameters:
+        - $ref: '#/components/parameters/QueryPage'
+        - $ref: '#/components/parameters/QuerySize'
+        - name: roomId
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+          description: 按房间 ID 筛选
+        - name: date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+          description: 按北京时间日历日筛选，返回与该日有交集的会议
+          example: '2026-09-16'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/MeetingStatusFilter'
+          description: 按会议状态筛选
+        - name: onlyMine
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: true 时仅返回我发起或我正在参与（leftAt 为 null）的会议
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultPageMeetingVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  records:
+                    - id: 101
+                      title: 产品评审会
+                      description: Q3 需求评审
+                      roomId: 1
+                      roomName: 301会议室
+                      organizerId: 1001
+                      organizerUsername: alice
+                      startTime: '2026-09-16T10:00:00+08:00'
+                      endTime: '2026-09-16T11:30:00+08:00'
+                      status: ACTIVE
+                      endedEarly: false
+                      participantCount: 3
+                      createdAt: '2026-09-15T12:00:00+08:00'
+                      updatedAt: '2026-09-15T12:00:00+08:00'
+                  total: 1
+                  page: 1
+                  size: 10
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - meetings
+      operationId: createMeeting
+      summary: 创建会议
+      description: |-
+        创建会议，创建者自动成为发起人（自动写入 is_organizer=1 的参会记录，占 1 个名额）。
+        服务端按顺序校验（任一失败即返回对应错误码）：
+        1. 字段格式校验 → 40001；
+        2. 时间规则（未来 72h 内开始、15min 对齐、时长 15min–24h）→ 40905；
+        3. 房间存在性 → 40401；房间已停用 → 40906；
+        4. 房间时段冲突（与 status=ACTIVE 会议的 `[start,end)` 重叠）→ 40902。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40001, 40002, 40101, 40102, 40401, 40902, 40905, 40906, 50000]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMeetingRequest'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultMeetingVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 101
+                  title: 产品评审会
+                  description: Q3 需求评审
+                  roomId: 1
+                  roomName: 301会议室
+                  organizerId: 1001
+                  organizerUsername: alice
+                  startTime: '2026-09-16T10:00:00+08:00'
+                  endTime: '2026-09-16T11:30:00+08:00'
+                  status: ACTIVE
+                  endedEarly: false
+                  participantCount: 1
+                  createdAt: '2026-09-15T16:30:00+08:00'
+                  updatedAt: '2026-09-15T16:30:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/meetings/{id}:
+    get:
+      tags:
+        - meetings
+      operationId: getMeeting
+      summary: 会议详情
+      description: |-
+        返回会议详情及全部参会记录（participants 含已退出与被踢记录，按 joinedAt 升序）。
+        status=CANCELLED 的会议可正常查看（分享链接显示已取消）；
+        status=DELETED 或不存在返回 404（对所有用户一致，不暴露删除痕迹差异）。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40001, 40101, 40102, 40401, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultMeetingDetailVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 101
+                  title: 产品评审会
+                  description: Q3 需求评审
+                  roomId: 1
+                  roomName: 301会议室
+                  organizerId: 1001
+                  organizerUsername: alice
+                  startTime: '2026-09-16T10:00:00+08:00'
+                  endTime: '2026-09-16T11:30:00+08:00'
+                  status: ACTIVE
+                  endedEarly: false
+                  participantCount: 2
+                  createdAt: '2026-09-15T16:30:00+08:00'
+                  updatedAt: '2026-09-15T16:30:00+08:00'
+                  participants:
+                    - id: 501
+                      meetingId: 101
+                      accountId: 1001
+                      username: alice
+                      isOrganizer: true
+                      banned: false
+                      joinedAt: '2026-09-15T16:30:00+08:00'
+                      leftAt: null
+                      leaveReason: null
+                    - id: 502
+                      meetingId: 101
+                      accountId: 1002
+                      username: bob
+                      isOrganizer: false
+                      banned: false
+                      joinedAt: '2026-09-15T17:00:00+08:00'
+                      leftAt: null
+                      leaveReason: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      tags:
+        - meetings
+      operationId: updateMeeting
+      summary: 修改会议
+      description: |-
+        修改会议信息（PUT 语义，提交完整字段）。仅发起人或 ADMIN。
+        规则：
+        - 会议必须 status=ACTIVE，否则 40909；
+        - 未开始的会议（startTime > now）可修改全部字段：新时间须通过全部时间规则（40905），
+          换房间须启用（40906）且无冲突（40902），新房间 capacity 不得小于当前有效参会人数（40903）；
+        - 已开始未结束的会议仅允许修改 title / description；roomId、startTime、endTime 必须与原值一致，
+          否则 40909（此时服务端跳过时间与冲突校验）。
+      x-permission: ORGANIZER_OR_ADMIN
+      x-error-codes: [40001, 40002, 40101, 40102, 40301, 40401, 40902, 40903, 40905, 40906, 40909, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMeetingRequest'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultMeetingVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 101
+                  title: 产品评审会（改期）
+                  description: Q3 需求评审，议题更新
+                  roomId: 2
+                  roomName: 302会议室
+                  organizerId: 1001
+                  organizerUsername: alice
+                  startTime: '2026-09-16T14:00:00+08:00'
+                  endTime: '2026-09-16T15:30:00+08:00'
+                  status: ACTIVE
+                  endedEarly: false
+                  participantCount: 2
+                  createdAt: '2026-09-15T16:30:00+08:00'
+                  updatedAt: '2026-09-15T18:00:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags:
+        - meetings
+      operationId: deleteMeeting
+      summary: 删除会议（逻辑删除）
+      description: |-
+        逻辑删除会议：status 置为 DELETED，释放其占用时段（房间冲突检测仅看 ACTIVE），
+        对普通用户不可见；参会记录与通知保留关联，不级联物理删除。仅发起人或 ADMIN。
+        会议不存在或已是 DELETED 返回 40401；CANCELLED/ENDED 会议也可删除。
+      x-permission: ORGANIZER_OR_ADMIN
+      x-error-codes: [40001, 40101, 40102, 40301, 40401, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultVoid'
+              example:
+                code: 0
+                message: success
+                data: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/meetings/{id}/cancel:
+    patch:
+      tags:
+        - meetings
+      operationId: cancelMeeting
+      summary: 取消会议
+      description: |-
+        取消会议：status 置为 CANCELLED，释放占用时段，会议仍可查看（链接显示已取消）。
+        仅发起人或 ADMIN；仅允许对“未开始的 ACTIVE 会议”（startTime > now）取消；
+        已开始的会议请使用 end-early；ENDED/CANCELLED/DELETED 状态返回 409 + code=40909。
+        无请求体。
+      x-permission: ORGANIZER_OR_ADMIN
+      x-error-codes: [40001, 40101, 40102, 40301, 40401, 40909, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: 取消成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultMeetingVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 101
+                  title: 产品评审会
+                  description: Q3 需求评审
+                  roomId: 1
+                  roomName: 301会议室
+                  organizerId: 1001
+                  organizerUsername: alice
+                  startTime: '2026-09-16T10:00:00+08:00'
+                  endTime: '2026-09-16T11:30:00+08:00'
+                  status: CANCELLED
+                  endedEarly: false
+                  participantCount: 2
+                  createdAt: '2026-09-15T16:30:00+08:00'
+                  updatedAt: '2026-09-15T19:00:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/meetings/{id}/end-early:
+    patch:
+      tags:
+        - meetings
+      operationId: endMeetingEarly
+      summary: 提前结束会议
+      description: |-
+        提前结束进行中的会议：status 置为 ENDED、endedEarly=true，立即释放剩余时段并停止报名。
+        仅发起人或 ADMIN；仅允许当会议 status=ACTIVE 且 startTime <= now < endTime（进行中）时调用；
+        未开始的会议请使用 cancel，其他状态返回 409 + code=40909。无请求体。
+      x-permission: ORGANIZER_OR_ADMIN
+      x-error-codes: [40001, 40101, 40102, 40301, 40401, 40909, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: 提前结束成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultMeetingVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 101
+                  title: 产品评审会
+                  description: Q3 需求评审
+                  roomId: 1
+                  roomName: 301会议室
+                  organizerId: 1001
+                  organizerUsername: alice
+                  startTime: '2026-09-16T10:00:00+08:00'
+                  endTime: '2026-09-16T11:30:00+08:00'
+                  status: ENDED
+                  endedEarly: true
+                  participantCount: 2
+                  createdAt: '2026-09-15T16:30:00+08:00'
+                  updatedAt: '2026-09-16T10:45:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/meetings/{id}/participants:
+    post:
+      tags:
+        - participants
+      operationId: joinMeeting
+      summary: 报名参会
+      description: |-
+        当前登录用户报名加入会议。无请求体。
+        服务端按顺序校验（任一失败即返回对应错误码）：
+        1. 会议存在且 status 非 DELETED → 否则 40401；
+        2. 会议 status=ACTIVE 且未开始（startTime > now）→ 否则 40909（已开始的会议停止报名）；
+        3. 本人无 banned=1（leaveReason=KICKED）记录 → 否则 40904（被踢永久禁入，不重置）；
+        4. 本人无有效参会记录（leftAt 为 null，含发起人记录）→ 否则 40908；
+        5. 有效参会人数 < 房间 capacity → 否则 40903；
+        6. 存在 leaveReason=USER_LEFT 的历史记录时复用该行（leftAt/leaveReason 置 null，banned 保持 0），
+           不新增行，同样返回 200。
+        成功后向发起人发送报名通知（异步，不在本响应中体现）。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40001, 40101, 40102, 40401, 40903, 40904, 40908, 40909, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: 报名成功（含退出后重新报名）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultParticipantVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 503
+                  meetingId: 101
+                  accountId: 1003
+                  username: carol
+                  isOrganizer: false
+                  banned: false
+                  joinedAt: '2026-09-15T20:00:00+08:00'
+                  leftAt: null
+                  leaveReason: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags:
+        - participants
+      operationId: listParticipants
+      summary: 参会者列表
+      description: |-
+        返回该会议的全部参会记录（含已退出与被踢记录），按 joinedAt 升序、id 升序。
+        有效参会者 = leftAt 为 null 的记录；participantCount 口径与此一致。
+        会议不存在或 status=DELETED 返回 40401。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40001, 40101, 40102, 40401, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultParticipantVOList'
+              example:
+                code: 0
+                message: success
+                data:
+                  - id: 501
+                    meetingId: 101
+                    accountId: 1001
+                    username: alice
+                    isOrganizer: true
+                    banned: false
+                    joinedAt: '2026-09-15T16:30:00+08:00'
+                    leftAt: null
+                    leaveReason: null
+                  - id: 502
+                    meetingId: 101
+                    accountId: 1002
+                    username: bob
+                    isOrganizer: false
+                    banned: false
+                    joinedAt: '2026-09-15T17:00:00+08:00'
+                    leftAt: '2026-09-15T18:00:00+08:00'
+                    leaveReason: USER_LEFT
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/meetings/{id}/participants/me:
+    delete:
+      tags:
+        - participants
+      operationId: leaveMeeting
+      summary: 退出报名（本人）
+      description: |-
+        当前登录用户退出自己的有效参会记录：leftAt=now、leaveReason=USER_LEFT，banned 保持 0。
+        会议须为 ACTIVE 且未开始（已开始/已结束/已取消的会议无需退出，返回 40909）。
+        发起人不能退出自己的会议（应使用 cancel），返回 40909。
+        本人无有效参会记录返回 40401。退出后允许重新报名。无请求体。
+        成功后向发起人发送退出通知（异步）。
+      x-permission: SELF
+      x-error-codes: [40001, 40101, 40102, 40401, 40909, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: 退出成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultVoid'
+              example:
+                code: 0
+                message: success
+                data: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/meetings/{id}/participants/{accountId}:
+    delete:
+      tags:
+        - participants
+      operationId: kickParticipant
+      summary: 踢出参会者
+      description: |-
+        将指定账号移出会议并永久禁止再次加入：banned=1、leaveReason=KICKED、leftAt=now。
+        仅发起人或 ADMIN。会议须为 ACTIVE，否则 40909。
+        目标账号须存在有效参会记录（leftAt 为 null），否则 40401；
+        不能踢发起人（accountId=organizerId），返回 40909。
+        成功后向被踢人发送踢人通知（异步）。无请求体。
+      x-permission: ORGANIZER_OR_ADMIN
+      x-error-codes: [40001, 40101, 40102, 40301, 40401, 40909, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+        - $ref: '#/components/parameters/PathAccountId'
+      responses:
+        '200':
+          description: 踢人成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultVoid'
+              example:
+                code: 0
+                message: success
+                data: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/notifications:
+    get:
+      tags:
+        - notifications
+      operationId: listNotifications
+      summary: 站内通知列表
+      description: |-
+        分页查询当前登录用户的站内通知。
+        默认排序：未读优先（isRead ASC），同组内按 createdAt DESC、id DESC。
+        可选 `isRead` 筛选；`isRead=false&size=1` 可用于获取未读总数（total 即未读数）。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40001, 40101, 40102, 50000]
+      parameters:
+        - $ref: '#/components/parameters/QueryPage'
+        - $ref: '#/components/parameters/QuerySize'
+        - name: isRead
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: 按已读状态筛选；缺省返回全部
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultPageNotificationVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  records:
+                    - id: 9001
+                      type: PARTICIPANT_JOINED
+                      title: 新参会者
+                      content: 用户 bob 报名了你的会议「产品评审会」。
+                      meetingId: 101
+                      isRead: false
+                      createdAt: '2026-09-15T17:00:00+08:00'
+                    - id: 9000
+                      type: MEETING_ENDED
+                      title: 会议已结束
+                      content: '会议「周会」已于 2026-09-15 12:00 结束。'
+                      meetingId: 99
+                      isRead: true
+                      createdAt: '2026-09-15T12:00:00+08:00'
+                  total: 2
+                  page: 1
+                  size: 10
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/notifications/{id}/read:
+    patch:
+      tags:
+        - notifications
+      operationId: markNotificationRead
+      summary: 标记单条已读
+      description: |-
+        将当前登录用户的指定通知标记为已读。幂等：已读的通知重复调用仍返回 200。
+        通知不存在或不属于当前用户均返回 40401（不区分，防止枚举他人通知 ID）。无请求体。
+      x-permission: SELF
+      x-error-codes: [40001, 40101, 40102, 40401, 50000]
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: 标记成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultNotificationVO'
+              example:
+                code: 0
+                message: success
+                data:
+                  id: 9001
+                  type: PARTICIPANT_JOINED
+                  title: 新参会者
+                  content: 用户 bob 报名了你的会议「产品评审会」。
+                  meetingId: 101
+                  isRead: true
+                  createdAt: '2026-09-15T17:00:00+08:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/notifications/read-all:
+    patch:
+      tags:
+        - notifications
+      operationId: markAllNotificationsRead
+      summary: 全部标记已读
+      description: |-
+        将当前登录用户的全部未读通知标记为已读，返回本次更新的条数（data 为整数）。
+        路径常量 `read-all` 与 `/{id}` 不冲突：{id} 仅匹配 int64。无请求体。
+      x-permission: AUTHENTICATED
+      x-error-codes: [40101, 40102, 50000]
+      responses:
+        '200':
+          description: 标记成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultInt'
+              example:
+                code: 0
+                message: success
+                data: 3
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |-
+        将 Access Token 放入请求头：`Authorization: Bearer <accessToken>`。
+        未携带 / 签名无效 / 已被撤销（logout 或账号禁用后）→ 401 + code=40101；
+        已过期 → 401 + code=40102（前端应调用 POST /api/auth/refresh 换新）。
+  parameters:
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      description: 资源 ID
+    PathAccountId:
+      name: accountId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      description: 账号 ID
+    QueryPage:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        default: 1
+      description: 页码，从 1 开始
+    QuerySize:
+      name: size
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        maximum: 100
+        default: 10
+      description: 每页条数，最大 100
+  responses:
+    BadRequest:
+      description: 参数校验失败（code=40001，data.fieldErrors 给出字段级错误）或请求格式错误（code=40002，如 JSON 解析失败 / 类型不匹配）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResult'
+          example:
+            code: 40001
+            message: 参数校验失败
+            data:
+              fieldErrors:
+                - field: startTime
+                  message: 必须按 15 分钟对齐
+    Unauthorized:
+      description: 未认证或凭证无效（code=40101 未携带/无效/已撤销，40102 Token 过期，40103 用户名或密码错误，40104 Refresh Token 无效/过期/已撤销）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResult'
+          example:
+            code: 40101
+            message: 未认证或 Token 无效
+            data: null
+    Forbidden:
+      description: 已认证但无权限（code=40301 无权限，40302 账号已禁用）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResult'
+          example:
+            code: 40301
+            message: 无权限执行该操作
+            data: null
+    NotFound:
+      description: 资源不存在或对当前用户不可见（code=40401）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResult'
+          example:
+            code: 40401
+            message: 资源不存在
+            data: null
+    Conflict:
+      description: 业务规则冲突，code 取值见该端点 x-error-codes（40901–40909）与 README 错误码表
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResult'
+          example:
+            code: 40902
+            message: 会议时间与该房间已有会议冲突
+            data: null
+    InternalError:
+      description: 服务器内部错误（code=50000），响应不包含堆栈或内部细节
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResult'
+          example:
+            code: 50000
+            message: 服务器内部错误
+            data: null
+  schemas:
+    FieldError:
+      type: object
+      required:
+        - field
+        - message
+      properties:
+        field:
+          type: string
+          description: 校验失败的字段名（JSON 字段路径）
+        message:
+          type: string
+          description: 字段级错误信息（中文）
+    ErrorResult:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: integer
+          format: int32
+          description: 非 0 业务错误码，见 README 错误码表
+        message:
+          type: string
+          description: 人类可读错误信息（中文），不含敏感内部细节
+        data:
+          type: object
+          nullable: true
+          description: 通常为 null；code=40001 时携带 fieldErrors 字段级错误列表
+          properties:
+            fieldErrors:
+              type: array
+              items:
+                $ref: '#/components/schemas/FieldError'
+    Result:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: integer
+          format: int32
+          description: 0=成功
+        message:
+          type: string
+          description: 提示信息（中文），成功时为 success 或操作描述
+        data:
+          description: 业务数据，类型见各 ResultXxx 包装 schema；无数据操作时为 null
+    ResultVoid:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              type: object
+              nullable: true
+              description: 固定为 null
+    ResultInt:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              type: integer
+              format: int32
+              description: 整数结果（如批量操作影响条数）
+    ResultAuthTokenVO:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/AuthTokenVO'
+    ResultAccountVO:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/AccountVO'
+    ResultRoomVO:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/RoomVO'
+    ResultRoomVOList:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/RoomVO'
+    ResultRoomAvailabilityVO:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/RoomAvailabilityVO'
+    ResultMeetingVO:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/MeetingVO'
+    ResultMeetingDetailVO:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/MeetingDetailVO'
+    ResultPageMeetingVO:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/PageMeetingVO'
+    ResultParticipantVO:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/ParticipantVO'
+    ResultParticipantVOList:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/ParticipantVO'
+    ResultNotificationVO:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/NotificationVO'
+    ResultPageNotificationVO:
+      allOf:
+        - $ref: '#/components/schemas/Result'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/PageNotificationVO'
+    PageMeetingVO:
+      type: object
+      required:
+        - records
+        - total
+        - page
+        - size
+      properties:
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/MeetingVO'
+        total:
+          type: integer
+          format: int64
+          description: 满足筛选条件的总条数
+        page:
+          type: integer
+          format: int32
+          description: 当前页码（回显请求值）
+        size:
+          type: integer
+          format: int32
+          description: 每页条数（回显请求值）
+    PageNotificationVO:
+      type: object
+      required:
+        - records
+        - total
+        - page
+        - size
+      properties:
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/NotificationVO'
+        total:
+          type: integer
+          format: int64
+        page:
+          type: integer
+          format: int32
+        size:
+          type: integer
+          format: int32
+    Role:
+      type: string
+      enum:
+        - USER
+        - ADMIN
+    AccountVO:
+      type: object
+      description: 账号视图对象（脱敏，绝不含 password_hash）
+      required:
+        - id
+        - username
+        - role
+        - status
+        - createdAt
+      properties:
+        id:
+          type: integer
+          format: int64
+        username:
+          type: string
+          maxLength: 50
+        role:
+          $ref: '#/components/schemas/Role'
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 0
+            - 1
+          description: 1=正常，0=禁用
+        createdAt:
+          type: string
+          format: date-time
+    RegisterRequest:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          type: string
+          pattern: '^[A-Za-z0-9_]{3,50}$'
+          description: 3–50 位，仅字母 / 数字 / 下划线；全局唯一
+          example: alice
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 64
+          description: 明文密码（传输层保护），8–64 位，服务端 BCrypt 加密存储
+    LoginRequest:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 50
+        password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 64
+    RefreshRequest:
+      type: object
+      required:
+        - refreshToken
+      properties:
+        refreshToken:
+          type: string
+          minLength: 1
+          description: 登录 / 注册 / 上次刷新时签发的 Refresh Token；成功刷新后旧值立即失效（轮换）
+    AuthTokenVO:
+      type: object
+      required:
+        - tokenType
+        - accessToken
+        - accessTokenExpiresIn
+        - refreshToken
+        - refreshTokenExpiresIn
+      properties:
+        tokenType:
+          type: string
+          enum:
+            - Bearer
+        accessToken:
+          type: string
+          description: 'JWT Access Token，放入 Authorization: Bearer 头'
+        accessTokenExpiresIn:
+          type: integer
+          format: int64
+          description: Access Token 有效期（秒，自签发起算；示例 1800，实际值以服务端配置为准）
+        refreshToken:
+          type: string
+          description: Refresh Token，仅用于 POST /api/auth/refresh
+        refreshTokenExpiresIn:
+          type: integer
+          format: int64
+          description: Refresh Token 有效期（秒，自签发起算；30 天 = 2592000）
+    Equipment:
+      type: string
+      enum:
+        - PROJECTOR
+        - WHITEBOARD
+        - VIDEO_CONFERENCE
+        - PHONE
+      description: 固定设备选项：PROJECTOR=投影仪，WHITEBOARD=白板，VIDEO_CONFERENCE=视频会议，PHONE=电话
+    RoomVO:
+      type: object
+      required:
+        - id
+        - name
+        - location
+        - capacity
+        - equipment
+        - enabled
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+          maxLength: 100
+        location:
+          type: string
+          maxLength: 200
+          nullable: true
+        capacity:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 100
+        equipment:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Equipment'
+          description: 设备列表，可为空数组
+        enabled:
+          type: boolean
+          description: true=启用可预约；false=停用（软删除，历史关联保留）
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    CreateRoomRequest:
+      type: object
+      required:
+        - name
+        - capacity
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        location:
+          type: string
+          maxLength: 200
+          nullable: true
+        capacity:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 100
+        equipment:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Equipment'
+          description: 省略或空数组表示无设备
+    UpdateRoomRequest:
+      type: object
+      description: PUT 全量更新；location 省略视为 null，equipment 省略视为空数组；不含 enabled（走 status 端点）
+      required:
+        - name
+        - capacity
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        location:
+          type: string
+          maxLength: 200
+          nullable: true
+        capacity:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 100
+        equipment:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Equipment'
+    RoomStatusRequest:
+      type: object
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean
+          description: true=启用；false=停用（存在 ACTIVE 会议时拒绝，40907）
+    TimeSlot:
+      type: object
+      description: 已占用时段，`[startTime, endTime)` 半开区间
+      required:
+        - meetingId
+        - startTime
+        - endTime
+      properties:
+        meetingId:
+          type: integer
+          format: int64
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+    RoomAvailabilityVO:
+      type: object
+      description: |-
+        房间占用查询结果。occupiedSlots 为与查询日期范围有交集的 status=ACTIVE 会议时段，
+        按 startTime 升序。空闲时段 = 查询范围（北京时间日历日 00:00–24:00）减去占用时段，由前端计算。
+      required:
+        - roomId
+        - startDate
+        - endDate
+        - occupiedSlots
+      properties:
+        roomId:
+          type: integer
+          format: int64
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+        occupiedSlots:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeSlot'
+    MeetingStatus:
+      type: string
+      enum:
+        - ACTIVE
+        - ENDED
+        - CANCELLED
+        - DELETED
+      description: |-
+        ACTIVE=有效（占用时段，未结束；含未开始与进行中）；
+        ENDED=已结束（正常到期 endedEarly=false 或提前结束 endedEarly=true）；
+        CANCELLED=已取消（保留可见）；
+        DELETED=已逻辑删除（任何列表/详情不返回）
+    MeetingStatusFilter:
+      type: string
+      enum:
+        - ACTIVE
+        - ENDED
+        - CANCELLED
+      description: 列表筛选允许的状态（DELETED 不可筛选）
+    ParticipantVO:
+      type: object
+      required:
+        - id
+        - meetingId
+        - accountId
+        - username
+        - isOrganizer
+        - banned
+        - joinedAt
+        - leftAt
+        - leaveReason
+      properties:
+        id:
+          type: integer
+          format: int64
+        meetingId:
+          type: integer
+          format: int64
+        accountId:
+          type: integer
+          format: int64
+        username:
+          type: string
+          maxLength: 50
+        isOrganizer:
+          type: boolean
+          description: 是否发起人（创建会议时自动写入 true）
+        banned:
+          type: boolean
+          description: 是否被踢禁入；true 时 leaveReason 必为 KICKED
+        joinedAt:
+          type: string
+          format: date-time
+        leftAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: null=有效参会中；非 null=已退出/被踢
+        leaveReason:
+          type: string
+          enum:
+            - USER_LEFT
+            - KICKED
+            - null
+          nullable: true
+          description: null=未退出；USER_LEFT=主动退出（可重新报名）；KICKED=被踢（banned=1，永久禁入）
+    MeetingVO:
+      type: object
+      required:
+        - id
+        - title
+        - description
+        - roomId
+        - roomName
+        - organizerId
+        - organizerUsername
+        - startTime
+        - endTime
+        - status
+        - endedEarly
+        - participantCount
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: integer
+          format: int64
+        title:
+          type: string
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 5000
+          nullable: true
+        roomId:
+          type: integer
+          format: int64
+        roomName:
+          type: string
+          maxLength: 100
+          description: 冗余房间名称快照（便于展示；房间改名后不保证回溯更新）
+        organizerId:
+          type: integer
+          format: int64
+        organizerUsername:
+          type: string
+          maxLength: 50
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+        status:
+          $ref: '#/components/schemas/MeetingStatus'
+        endedEarly:
+          type: boolean
+          description: 是否提前结束（仅 status=ENDED 时有意义）
+        participantCount:
+          type: integer
+          format: int32
+          minimum: 0
+          description: 当前有效参会人数（leftAt 为 null 的记录数，含发起人）
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    MeetingDetailVO:
+      allOf:
+        - $ref: '#/components/schemas/MeetingVO'
+        - type: object
+          required:
+            - participants
+          properties:
+            participants:
+              type: array
+              items:
+                $ref: '#/components/schemas/ParticipantVO'
+              description: 全部参会记录（含已退出/被踢），按 joinedAt 升序
+    CreateMeetingRequest:
+      type: object
+      required:
+        - title
+        - roomId
+        - startTime
+        - endTime
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 5000
+          nullable: true
+        roomId:
+          type: integer
+          format: int64
+          minimum: 1
+        startTime:
+          type: string
+          format: date-time
+          description: '北京时间（+08:00）；不早于 now、不晚于 now+72h；15 分钟对齐'
+        endTime:
+          type: string
+          format: date-time
+          description: '北京时间（+08:00）；晚于 startTime；15 分钟对齐；时长 15min–24h；可超出 72h 窗口、允许跨天'
+    UpdateMeetingRequest:
+      type: object
+      description: PUT 全量语义。未开始的会议可改全部字段；已开始会议仅 title/description 可变，其余字段须与原值一致
+      required:
+        - title
+        - roomId
+        - startTime
+        - endTime
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 5000
+          nullable: true
+        roomId:
+          type: integer
+          format: int64
+          minimum: 1
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+    NotificationType:
+      type: string
+      enum:
+        - PARTICIPANT_JOINED
+        - PARTICIPANT_LEFT
+        - PARTICIPANT_KICKED
+        - MEETING_ENDED
+      description: |-
+        通知类型与默认收件人（Open Questions 已批准默认值）：
+        PARTICIPANT_JOINED=有人报名→发发起人；PARTICIPANT_LEFT=有人退出→发发起人；
+        PARTICIPANT_KICKED=被踢→发被踢人；MEETING_ENDED=会议结束（含到期自动结束与提前结束）→发全体有效参会者。
+        会议修改/取消/删除不产生通知。
+    NotificationVO:
+      type: object
+      required:
+        - id
+        - type
+        - title
+        - content
+        - meetingId
+        - isRead
+        - createdAt
+      properties:
+        id:
+          type: integer
+          format: int64
+        type:
+          $ref: '#/components/schemas/NotificationType'
+        title:
+          type: string
+          maxLength: 200
+        content:
+          type: string
+        meetingId:
+          type: integer
+          format: int64
+          nullable: true
+          description: 关联会议 ID，可空
+        isRead:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
