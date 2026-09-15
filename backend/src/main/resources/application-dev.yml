@@ -18,10 +18,25 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
+    placeholders:
+      # DEV-ONLY bootstrap credential (admin/Admin@123456) injected into
+      # V2__seed_rooms.sql via ${admin-password-hash}. For local development only;
+      # staging/prod inject their own hash via the ADMIN_PASSWORD_HASH env var
+      # (no default -> startup fails fast when unset).
+      admin-password-hash: "$2a$10$/WCWM/aD6u8salk.29S.LOcRrtVfWNw2fRg3DIMHiqyqpSXn/vNPm"
+
+app:
+  cors:
+    # Local Vite dev server origins only.
+    allowed-origins:
+      - http://localhost:5173
+      - http://127.0.0.1:5173
 
 roomflow:
   jwt:
-    secret: ${JWT_SECRET}
+    # Dev-only placeholder secret for local development. Never use outside dev;
+    # staging/prod fail to start unless ROOMFLOW_JWT_SECRET (or JWT_SECRET) is set.
+    secret: ${ROOMFLOW_JWT_SECRET:${JWT_SECRET:dev-only-insecure-jwt-secret-do-not-use-in-prod-0000}}
     access-ttl: ${JWT_ACCESS_TTL:15m}
     refresh-ttl: ${JWT_REFRESH_TTL:30d}
 

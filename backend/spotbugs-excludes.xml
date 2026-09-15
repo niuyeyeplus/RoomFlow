@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SpotBugs exclude filter for roomflow-backend.
+
+  Rationale:
+  - EI_EXPOSE_REP / EI_EXPOSE_REP2: flagged on Spring dependency-injected beans
+    (services, controllers, security components, MQ) and on DTO/VO List
+    accessors. Spring-managed singletons are deliberately shared references;
+    DTOs serialize through Jackson and are not mutated after construction.
+    These are accepted idiomatic-Spring false positives.
+  - CT_CONSTRUCTOR_THROW on JwtTokenProvider: the constructor intentionally
+    fails fast when the JWT secret is missing/weak in staging/prod profiles.
+    A partially-initialized bean is never reachable because the context fails
+    to start.
+-->
+<FindBugsFilter>
+  <Match>
+    <Or>
+      <Bug pattern="EI_EXPOSE_REP"/>
+      <Bug pattern="EI_EXPOSE_REP2"/>
+    </Or>
+  </Match>
+  <Match>
+    <Class name="com.roomflow.security.JwtTokenProvider"/>
+    <Bug pattern="CT_CONSTRUCTOR_THROW"/>
+  </Match>
+</FindBugsFilter>
