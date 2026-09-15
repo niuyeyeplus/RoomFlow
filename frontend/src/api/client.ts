@@ -63,31 +63,30 @@ let refreshing: Promise<string | null> | null = null
 function refreshTokens(): Promise<string | null> {
   if (!refreshing) {
     const refreshToken = getRefreshToken()
-    if (!refreshToken) {
-      refreshing = Promise.resolve(null)
-    } else {
-      const pending = apiClient
-        .request<unknown, AuthTokenVO>({
-          method: 'POST',
-          url: '/api/auth/refresh',
-          data: { refreshToken },
-          _skipAuth: true,
-          _retried: true
-        })
-        .then((tokens) => {
-          setTokens(tokens)
-          return tokens.accessToken
-        })
-        .catch((e: unknown) => {
-          // 仅刷新凭证失效（40104）视为会话终结；其余错误向上传播，
-          // 由原请求以 ApiError 失败返回，不清会话
-          if (e instanceof ApiError && e.code === 40104) return null
-          throw e
-        })
-      refreshing = pending
-      // 不论成败都在结算后释放去重锁；两个分支均不抛错避免未处理拒绝
-      pending.then(resetRefreshing, resetRefreshing)
-    }
+    // 无 refresh token 时直接返回，不缓存 null —— 否则重新登录后锁残留，
+    // 后续 401 永远跳过刷新端点被强制登出
+    if (!refreshToken) return Promise.resolve(null)
+    const pending = apiClient
+      .request<unknown, AuthTokenVO>({
+        method: 'POST',
+        url: '/api/auth/refresh',
+        data: { refreshToken },
+        _skipAuth: true,
+        _retried: true
+      })
+      .then((tokens) => {
+        setTokens(tokens)
+        return tokens.accessToken
+      })
+      .catch((e: unknown) => {
+        // 仅刷新凭证失效（40104）视为会话终结；其余错误向上传播，
+        // 由原请求以 ApiError 失败返回，不清会话
+        if (e instanceof ApiError && e.code === 40104) return null
+        throw e
+      })
+    refreshing = pending
+    // 不论成败都在结算后释放去重锁；两个分支均不抛错避免未处理拒绝
+    pending.then(resetRefreshing, resetRefreshing)
   }
   return refreshing
 }

@@ -79,7 +79,7 @@ public class RoomService {
 
   @Transactional(rollbackFor = Exception.class)
   public RoomVO updateStatus(Long id, RoomStatusRequest request) {
-    Room room = requireRoom(id);
+    Room room = requireRoomForUpdate(id);
     if (Boolean.FALSE.equals(request.getEnabled())) {
       ensureNoUnfinishedMeetings(id);
     }
@@ -94,7 +94,7 @@ public class RoomService {
    */
   @Transactional(rollbackFor = Exception.class)
   public void delete(Long id) {
-    Room room = requireRoom(id);
+    Room room = requireRoomForUpdate(id);
     if (Boolean.FALSE.equals(room.getEnabled())) {
       return;
     }
@@ -154,6 +154,23 @@ public class RoomService {
 
   private Room requireRoom(Long id) {
     Room room = id == null ? null : roomMapper.selectById(id);
+    if (room == null) {
+      throw new BizException(ErrorCode.NOT_FOUND);
+    }
+    return room;
+  }
+
+  /**
+   * FOR UPDATE locks the room row for the whole transaction so disable/delete serializes with
+   * {@link MeetingService#create} on the same row lock — otherwise a concurrent create could commit
+   * an ACTIVE meeting after the "no unfinished meetings" check passed (TOCTOU).
+   */
+  private Room requireRoomForUpdate(Long id) {
+    Room room =
+        id == null
+            ? null
+            : roomMapper.selectOne(
+                new LambdaQueryWrapper<Room>().eq(Room::getId, id).last("FOR UPDATE"));
     if (room == null) {
       throw new BizException(ErrorCode.NOT_FOUND);
     }

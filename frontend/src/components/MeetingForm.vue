@@ -52,6 +52,9 @@ function checkTimeRange(value: [Date, Date] | null): string | null {
     return '请选择会议起止时间'
   }
   const [start, end] = value
+  // el-date-picker 可能携带非零秒/毫秒；就地归一化使校验与提交一致（契约要求秒=0）
+  start.setSeconds(0, 0)
+  end.setSeconds(0, 0)
   const now = Date.now()
   if (!isQuarterAligned(start) || !isQuarterAligned(end)) {
     return '起止时间须按15分钟对齐（分钟须为 00/15/30/45）'

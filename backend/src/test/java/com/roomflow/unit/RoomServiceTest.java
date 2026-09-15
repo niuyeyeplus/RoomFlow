@@ -114,7 +114,7 @@ class RoomServiceTest {
 
   @Test
   void disableRejectsWhenActiveUnfinishedMeetingExists() {
-    when(roomMapper.selectById(1L)).thenReturn(room(1L, true));
+    when(roomMapper.selectOne(any())).thenReturn(room(1L, true));
     when(meetingMapper.selectCount(any())).thenReturn(1L);
     RoomStatusRequest req = new RoomStatusRequest();
     req.setEnabled(false);
@@ -126,7 +126,7 @@ class RoomServiceTest {
   @Test
   void disableSucceedsWhenNoActiveMeetings() {
     Room r = room(1L, true);
-    when(roomMapper.selectById(1L)).thenReturn(r);
+    when(roomMapper.selectOne(any())).thenReturn(r);
     when(meetingMapper.selectCount(any())).thenReturn(0L);
     RoomStatusRequest req = new RoomStatusRequest();
     req.setEnabled(false);
@@ -137,7 +137,7 @@ class RoomServiceTest {
   @Test
   void enableSkipsActiveMeetingCheck() {
     Room r = room(1L, false);
-    when(roomMapper.selectById(1L)).thenReturn(r);
+    when(roomMapper.selectOne(any())).thenReturn(r);
     RoomStatusRequest req = new RoomStatusRequest();
     req.setEnabled(true);
     RoomVO vo = service.updateStatus(1L, req);
@@ -147,7 +147,7 @@ class RoomServiceTest {
 
   @Test
   void deleteIsIdempotentOnDisabledRoom() {
-    when(roomMapper.selectById(1L)).thenReturn(room(1L, false));
+    when(roomMapper.selectOne(any())).thenReturn(room(1L, false));
     service.delete(1L);
     verify(meetingMapper, never()).selectCount(any());
     verify(roomMapper, never()).updateById(any(Room.class));
@@ -155,7 +155,7 @@ class RoomServiceTest {
 
   @Test
   void deleteRejectsWithActiveMeeting() {
-    when(roomMapper.selectById(1L)).thenReturn(room(1L, true));
+    when(roomMapper.selectOne(any())).thenReturn(room(1L, true));
     when(meetingMapper.selectCount(any())).thenReturn(3L);
     BizException e = assertThrows(BizException.class, () -> service.delete(1L));
     assertEquals(40907, code(e));
@@ -164,7 +164,7 @@ class RoomServiceTest {
   @Test
   void deleteDisablesRoom() {
     Room r = room(1L, true);
-    when(roomMapper.selectById(1L)).thenReturn(r);
+    when(roomMapper.selectOne(any())).thenReturn(r);
     when(meetingMapper.selectCount(any())).thenReturn(0L);
     service.delete(1L);
     assertFalse(r.getEnabled());

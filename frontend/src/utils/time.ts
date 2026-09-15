@@ -58,9 +58,9 @@ export function beijingDayRange(dateStr: string): { start: Date; end: Date } {
   return { start, end: new Date(start.getTime() + DAY_MS) }
 }
 
-/** 是否按 15 分钟对齐（秒=0、毫秒=0 且分钟 %15=0） */
+/** 是否按 15 分钟对齐（epoch 毫秒判定，与时区无关；秒/毫秒须为 0） */
 export function isQuarterAligned(d: Date): boolean {
-  return d.getSeconds() === 0 && d.getMilliseconds() === 0 && d.getMinutes() % 15 === 0
+  return d.getTime() % (15 * 60 * 1000) === 0
 }
 
 export const MIN_DURATION_MS = 15 * 60 * 1000
