@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, onMounted, watch } from 'vue'
 import { RouterView, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -11,7 +11,7 @@ import { friendlyMessage } from '@/utils/errors'
 const route = useRoute()
 const authStore = useAuthStore()
 const notificationStore = useNotificationStore()
-const { isAuthenticated } = storeToRefs(authStore)
+const { isAuthenticated, isAdmin } = storeToRefs(authStore)
 const { unreadCount } = storeToRefs(notificationStore)
 const { user, logout } = useAuth()
 
@@ -53,6 +53,7 @@ async function handleLogout(): Promise<void> {
         <el-menu-item index="/meetings">会议列表</el-menu-item>
         <el-menu-item index="/rooms">会议室</el-menu-item>
         <el-menu-item index="/my-meetings">我的会议</el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/admin/rooms">管理后台</el-menu-item>
       </el-menu>
       <div class="header-right">
         <el-badge :value="unreadCount" :hidden="unreadCount === 0" class="bell">

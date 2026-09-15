@@ -194,4 +194,28 @@ class RoomControllerTest extends ControllerTestSupport {
         .andExpect(status().isConflict())
         .andExpect(jsonPath("$.code").value(40907));
   }
+
+  @Test
+  void updateRoomAsUserForbidden() throws Exception {
+    mockMvc
+        .perform(
+            put("/api/rooms/1")
+                .header("Authorization", bearer(USER_TOKEN))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"name\":\"x\",\"capacity\":5}"))
+        .andExpect(status().isForbidden())
+        .andExpect(jsonPath("$.code").value(40301));
+  }
+
+  @Test
+  void updateStatusAsUserForbidden() throws Exception {
+    mockMvc
+        .perform(
+            patch("/api/rooms/1/status")
+                .header("Authorization", bearer(USER_TOKEN))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"enabled\":false}"))
+        .andExpect(status().isForbidden())
+        .andExpect(jsonPath("$.code").value(40301));
+  }
 }
