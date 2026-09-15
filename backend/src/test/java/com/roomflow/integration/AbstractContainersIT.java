@@ -1,7 +1,9 @@
 package com.roomflow.integration;
 
+import java.io.IOException;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.Container;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.containers.RabbitMQContainer;
@@ -22,21 +24,40 @@ public abstract class AbstractContainersIT {
   protected static final GenericContainer<?> REDIS =
       new GenericContainer<>(DockerImageName.parse("redis:8.2")).withExposedPorts(6379);
 
-  // RabbitMQContainer defaults to vhost "/" plus the guest user, but the app connects to vhost
-  // "roomflow" as user "roomflow" (same topology as the dev middleware). Use the official image
-  // env vars: RABBITMQ_DEFAULT_VHOST makes "roomflow" the default user's home vhost, so the user
-  // is created at first boot with full permission on it — the deprecated withVhost/withUser/
-  // withPermission builder calls did not actually provision the user and broke PLAIN auth.
+  // The app connects to vhost "roomflow" as user "roomflow" (same topology as the dev
+  // middleware). Neither withVhost/withUser/withPermission (deprecated, silently no-op'd the
+  // user) nor RABBITMQ_DEFAULT_* env vars (overwritten by RabbitMQContainer.configure())
+  // reliably provision it, so the topology is created deterministically via rabbitmqctl
+  // after start — the container's wait strategy guarantees the broker is up by then.
   protected static final RabbitMQContainer RABBIT =
-      new RabbitMQContainer(DockerImageName.parse("rabbitmq:4.3"))
-          .withEnv("RABBITMQ_DEFAULT_USER", "roomflow")
-          .withEnv("RABBITMQ_DEFAULT_PASS", "roomflow")
-          .withEnv("RABBITMQ_DEFAULT_VHOST", "roomflow");
+      new RabbitMQContainer(DockerImageName.parse("rabbitmq:4.3"));
 
   static {
     MYSQL.start();
     REDIS.start();
     RABBIT.start();
+    rabbitctl("add_vhost", "roomflow");
+    rabbitctl("add_user", "roomflow", "roomflow");
+    rabbitctl("set_permissions", "-p", "roomflow", "roomflow", ".*", ".*", ".*");
+  }
+
+  /** Runs rabbitmqctl inside the broker container; any non-zero exit fails fast with stderr. */
+  private static void rabbitctl(String... args) {
+    String[] command = new String[args.length + 1];
+    command[0] = "rabbitmqctl";
+    System.arraycopy(args, 0, command, 1, args.length);
+    try {
+      Container.ExecResult result = RABBIT.execInContainer(command);
+      if (result.getExitCode() != 0) {
+        throw new IllegalStateException(
+            "rabbitmqctl " + String.join(" ", args) + " failed: " + result.getStderr());
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new ExceptionInInitializerError(e);
+    } catch (IOException | IllegalStateException e) {
+      throw new ExceptionInInitializerError(e);
+    }
   }
 
   @DynamicPropertySource
