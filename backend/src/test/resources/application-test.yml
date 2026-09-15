@@ -16,3 +16,7 @@ roomflow:
     secret: test-only-jwt-secret-not-for-production-0123456789
     access-ttl: 15m
     refresh-ttl: 30d
+  scheduler:
+    # No Redis in the test profile: disable scheduling/ShedLock so the context needs no
+    # RedisConnectionFactory. Integration tests (containers) run with scheduling enabled.
+    enabled: false
