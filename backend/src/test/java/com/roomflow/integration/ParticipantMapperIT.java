@@ -9,6 +9,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.roomflow.common.enums.LeaveReason;
 import com.roomflow.common.enums.MeetingStatus;
 import com.roomflow.common.enums.Role;
+import com.roomflow.common.util.BeijingTime;
 import com.roomflow.domain.account.Account;
 import com.roomflow.domain.meeting.Meeting;
 import com.roomflow.domain.participant.Participant;
@@ -19,6 +20,7 @@ import com.roomflow.mapper.RoomMapper;
 import com.roomflow.security.LoginAccount;
 import com.roomflow.service.ParticipantService;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -53,8 +55,13 @@ class ParticipantMapperIT extends AbstractContainersIT {
     m.setTitle("it 会议");
     m.setRoomId(1L); // seeded room
     m.setOrganizerId(organizerId);
-    m.setStartTime(LocalDateTime.now().plusHours(1));
-    m.setEndTime(LocalDateTime.now().plusHours(2));
+    // Meeting times are stored/compared in Beijing time — LocalDateTime.now() would follow
+    // the JVM zone (UTC in CI containers) and make the meeting appear already started to
+    // ParticipantService.requireJoinable. Truncated to the hour keeps times 15-min aligned.
+    LocalDateTime start =
+        LocalDateTime.now(BeijingTime.ZONE).plusHours(1).truncatedTo(ChronoUnit.HOURS);
+    m.setStartTime(start);
+    m.setEndTime(start.plusHours(1));
     m.setStatus(MeetingStatus.ACTIVE);
     m.setEndedEarly(false);
     meetingMapper.insert(m);
@@ -109,7 +116,7 @@ class ParticipantMapperIT extends AbstractContainersIT {
     p.setBanned(false);
     participantMapper.insert(p);
 
-    p.setLeftAt(LocalDateTime.now());
+    p.setLeftAt(LocalDateTime.now(BeijingTime.ZONE));
     p.setLeaveReason(LeaveReason.USER_LEFT);
     participantMapper.updateById(p); // non-null fields are written fine by updateById
 
