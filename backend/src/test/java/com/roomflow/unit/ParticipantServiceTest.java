@@ -5,11 +5,15 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.roomflow.common.enums.LeaveReason;
 import com.roomflow.common.enums.MeetingStatus;
 import com.roomflow.common.enums.NotificationType;
@@ -33,6 +37,9 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.List;
+import java.util.Objects;
+import org.apache.ibatis.builder.MapperBuilderAssistant;
+import org.apache.ibatis.session.Configuration;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -58,6 +65,16 @@ class ParticipantServiceTest {
   @Mock private NotificationProducer notificationProducer;
 
   private ParticipantService service;
+
+  // MyBatis-Plus resolves SFunction columns against TableInfo metadata. A pure Mockito JVM
+  // never bootstraps a SqlSessionFactory, so register Participant's TableInfo explicitly —
+  // otherwise LambdaUpdateWrapper.set(...) throws "can not find lambda cache for this entity".
+  // mapUnderscoreToCamelCase=true matches the app config so columns resolve to left_at etc.
+  static {
+    Configuration mybatisConfig = new Configuration();
+    mybatisConfig.setMapUnderscoreToCamelCase(true);
+    TableInfoHelper.initTableInfo(new MapperBuilderAssistant(mybatisConfig, ""), Participant.class);
+  }
 
   @BeforeEach
   void setUp() {
@@ -259,7 +276,24 @@ class ParticipantServiceTest {
     ParticipantVO vo = service.join(10L, USER);
 
     verify(participantMapper, never()).insert(any(Participant.class));
-    verify(participantMapper).updateById(left);
+    // updateById skips null fields (NOT_NULL strategy), so the rejoin must go through an
+    // explicit update wrapper — the regression assertion for the stale left_at bug caught
+    // by ParticipantMapperIT. MP binds set() values as #{ew.paramNameValuePairs.MPGENVALn}
+    // parameters even for null, so nulls are asserted via the param map, not "=null" text.
+    verify(participantMapper)
+        .update(
+            isNull(),
+            argThat(
+                w ->
+                    w instanceof LambdaUpdateWrapper<?> uw
+                        && uw.getSqlSet() != null
+                        && uw.getSqlSet().contains("left_at=")
+                        && uw.getSqlSet().contains("leave_reason=")
+                        && uw.getSqlSet().contains("joined_at=")
+                        && uw.getParamNameValuePairs().values().stream()
+                                .filter(Objects::isNull)
+                                .count()
+                            == 2));
     assertNull(left.getLeftAt());
     assertNull(left.getLeaveReason());
     assertEquals(50L, vo.getId());

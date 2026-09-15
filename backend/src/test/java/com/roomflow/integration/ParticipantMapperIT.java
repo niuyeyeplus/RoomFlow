@@ -16,6 +16,8 @@ import com.roomflow.mapper.AccountMapper;
 import com.roomflow.mapper.MeetingMapper;
 import com.roomflow.mapper.ParticipantMapper;
 import com.roomflow.mapper.RoomMapper;
+import com.roomflow.security.LoginAccount;
+import com.roomflow.service.ParticipantService;
 import java.time.LocalDateTime;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -34,6 +36,7 @@ class ParticipantMapperIT extends AbstractContainersIT {
   @Autowired private RoomMapper roomMapper;
   @Autowired private MeetingMapper meetingMapper;
   @Autowired private ParticipantMapper participantMapper;
+  @Autowired private ParticipantService participantService;
 
   private Long accountId(String username) {
     Account a = new Account();
@@ -108,12 +111,12 @@ class ParticipantMapperIT extends AbstractContainersIT {
 
     p.setLeftAt(LocalDateTime.now());
     p.setLeaveReason(LeaveReason.USER_LEFT);
-    participantMapper.updateById(p);
+    participantMapper.updateById(p); // non-null fields are written fine by updateById
 
-    // Rejoin: reuse the same row, no second insert.
-    p.setLeftAt(null);
-    p.setLeaveReason(null);
-    participantMapper.updateById(p);
+    // Rejoin through the real service path: it must reuse the row and clear
+    // left_at/leave_reason. Regression test: updateById silently skips null fields
+    // (default NOT_NULL strategy), which previously left the row in "left" state.
+    participantService.join(mid, new LoginAccount(uid, "it_user_c", Role.USER));
 
     Long count =
         participantMapper.selectCount(

@@ -1,6 +1,7 @@
 package com.roomflow.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.roomflow.common.enums.LeaveReason;
 import com.roomflow.common.enums.MeetingStatus;
 import com.roomflow.common.enums.NotificationType;
@@ -104,10 +105,20 @@ public class ParticipantService {
       }
     } else {
       // Reuse the USER_LEFT row: clear leftAt/leaveReason, banned stays 0, refresh joinedAt.
+      // updateById skips null fields under the default NOT_NULL field strategy, so the
+      // columns must be nulled through an explicit set(null) — otherwise the row keeps
+      // its left_at/leave_reason and remains in the "left" state after rejoin.
+      LocalDateTime rejoinAt = LocalDateTime.now(clock).truncatedTo(ChronoUnit.SECONDS);
+      participantMapper.update(
+          null,
+          new LambdaUpdateWrapper<Participant>()
+              .eq(Participant::getId, record.getId())
+              .set(Participant::getLeftAt, null)
+              .set(Participant::getLeaveReason, null)
+              .set(Participant::getJoinedAt, rejoinAt));
       record.setLeftAt(null);
       record.setLeaveReason(null);
-      record.setJoinedAt(LocalDateTime.now(clock).truncatedTo(ChronoUnit.SECONDS));
-      participantMapper.updateById(record);
+      record.setJoinedAt(rejoinAt);
     }
 
     notifyOrganizer(
