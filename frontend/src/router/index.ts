@@ -1,4 +1,4 @@
-﻿import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 
 const router = createRouter({
@@ -43,6 +43,12 @@ const router = createRouter({
       name: 'notifications',
       component: () => import('@/views/NotificationView.vue'),
       meta: { requiresAuth: true }
+    },
+    {
+      path: '/admin/rooms',
+      name: 'admin-rooms',
+      component: () => import('@/views/admin/RoomManageView.vue'),
+      meta: { requiresAuth: true, requiresAdmin: true }
     },
     {
       path: '/:pathMatch(.*)*',
