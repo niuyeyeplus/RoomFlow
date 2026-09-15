@@ -18,13 +18,13 @@
 -- do not depend on the MySQL session time zone.
 INSERT INTO room (name, location, capacity, equipment, enabled, created_at, updated_at)
 VALUES
-    ('301会议室', '3楼东侧', 8, 'PROJECTOR,WHITEBOARD',
+    ('301会议室', '3楼东侧', 8, 'PROJECTOR,WHITEBOARD', 1,
         CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00'),
         CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00')),
-    ('302会议室', '3楼西侧', 12, 'PROJECTOR,VIDEO_CONFERENCE',
+    ('302会议室', '3楼西侧', 12, 'PROJECTOR,VIDEO_CONFERENCE', 1,
         CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00'),
         CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00')),
-    ('多功能厅', '5楼', 20, 'PROJECTOR,WHITEBOARD,VIDEO_CONFERENCE,PHONE',
+    ('多功能厅', '5楼', 20, 'PROJECTOR,WHITEBOARD,VIDEO_CONFERENCE,PHONE', 1,
         CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00'),
         CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00'));
 
