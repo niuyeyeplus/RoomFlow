@@ -78,12 +78,20 @@ class MeetingLifecycleIT extends AbstractContainersIT {
     return new LoginAccount(admin.getId(), admin.getUsername(), Role.ADMIN);
   }
 
-  private Long roomId(int index) {
-    return roomMapper
-        .selectList(
-            new LambdaQueryWrapper<Room>().eq(Room::getEnabled, true).orderByAsc(Room::getId))
-        .get(index)
-        .getId();
+  /**
+   * Inserts a dedicated enabled room for a single test and returns its id. All ITs share one
+   * Testcontainers database, so picking the Nth enabled seed room both collides on time slots
+   * (leftover ACTIVE meetings from other ITs) and shifts index when other tests disable rooms. A
+   * fresh room per test makes cross-test slot overlap impossible, so nextSlot() reuse is safe.
+   */
+  private Long newRoom() {
+    Room room = new Room();
+    room.setName("IT-lifecycle-room");
+    room.setLocation("IT专用");
+    room.setCapacity(10);
+    room.setEnabled(true);
+    roomMapper.insert(room);
+    return room.getId();
   }
 
   private Account newUser(String username) {
@@ -170,8 +178,9 @@ class MeetingLifecycleIT extends AbstractContainersIT {
     LoginAccount admin = admin();
     Account user = newUser("it_sweep_user");
     LocalDateTime now = LocalDateTime.now(ZONE);
+    Long roomId = newRoom();
     // Already past its end_time: the next sweep must end it.
-    Meeting m = insertMeeting(roomId(0), admin.id(), now.minusHours(2), now.minusMinutes(30));
+    Meeting m = insertMeeting(roomId, admin.id(), now.minusHours(2), now.minusMinutes(30));
     addParticipant(m.getId(), admin.id(), true);
     addParticipant(m.getId(), user.getId(), false);
     Participant left = addParticipant(m.getId(), newUser("it_sweep_left").getId(), false);
@@ -216,7 +225,7 @@ class MeetingLifecycleIT extends AbstractContainersIT {
     LoginAccount admin = admin();
     Account user = newUser("it_early_user");
     LocalDateTime now = LocalDateTime.now(ZONE);
-    Long roomId = roomId(1);
+    Long roomId = newRoom();
     // In-progress meeting [now-1h, now+2h]; its tail overlaps any future booking.
     Meeting m = insertMeeting(roomId, admin.id(), now.minusHours(1), now.plusHours(2));
     addParticipant(m.getId(), admin.id(), true);
@@ -251,13 +260,14 @@ class MeetingLifecycleIT extends AbstractContainersIT {
   void endEarlyRejectsBeforeStartAndAtEndBoundary() {
     LoginAccount admin = admin();
     LocalDateTime now = LocalDateTime.now(ZONE);
-    Meeting future = insertMeeting(roomId(2), admin.id(), now.plusHours(1), now.plusHours(2));
+    Long roomId = newRoom();
+    Meeting future = insertMeeting(roomId, admin.id(), now.plusHours(1), now.plusHours(2));
     BizException e =
         assertThrows(BizException.class, () -> meetingService.endEarly(future.getId(), admin));
     assertEquals(40909, e.getErrorCode().getCode());
 
     // now == endTime belongs to the scheduler.
-    Meeting atEnd = insertMeeting(roomId(2), admin.id(), now.minusHours(1), now);
+    Meeting atEnd = insertMeeting(roomId, admin.id(), now.minusHours(1), now);
     e = assertThrows(BizException.class, () -> meetingService.endEarly(atEnd.getId(), admin));
     assertEquals(40909, e.getErrorCode().getCode());
   }
@@ -265,7 +275,7 @@ class MeetingLifecycleIT extends AbstractContainersIT {
   @Test
   void cancelKeepsMeetingVisibleAndReleasesSlot() {
     LoginAccount admin = admin();
-    Long roomId = roomId(0);
+    Long roomId = newRoom();
     OffsetDateTime start = nextSlot().plusHours(3);
     MeetingVO created =
         meetingService.create(createRequest(roomId, start, start.plusHours(1)), admin);
@@ -289,9 +299,10 @@ class MeetingLifecycleIT extends AbstractContainersIT {
   void deleteHidesMeetingButKeepsRows() {
     LoginAccount admin = admin();
     Account user = newUser("it_delete_user");
+    Long roomId = newRoom();
     OffsetDateTime start = nextSlot().plusHours(5);
     MeetingVO created =
-        meetingService.create(createRequest(roomId(1), start, start.plusHours(1)), admin);
+        meetingService.create(createRequest(roomId, start, start.plusHours(1)), admin);
     addParticipant(created.getId(), user.getId(), false);
 
     meetingService.delete(created.getId(), admin);
@@ -314,7 +325,7 @@ class MeetingLifecycleIT extends AbstractContainersIT {
   @Test
   void updateReschedulesBeforeStartAndExcludesSelfFromConflict() {
     LoginAccount admin = admin();
-    Long roomId = roomId(2);
+    Long roomId = newRoom();
     OffsetDateTime start = nextSlot().plusHours(6);
     MeetingVO created =
         meetingService.create(createRequest(roomId, start, start.plusHours(1)), admin);
@@ -342,7 +353,7 @@ class MeetingLifecycleIT extends AbstractContainersIT {
   @Test
   void updateClearsNullDescriptionToDbNull() {
     LoginAccount admin = admin();
-    Long roomId = roomId(0);
+    Long roomId = newRoom();
     OffsetDateTime start = nextSlot().plusHours(8);
     CreateMeetingRequest create = createRequest(roomId, start, start.plusHours(1));
     create.setDescription("初始说明");
