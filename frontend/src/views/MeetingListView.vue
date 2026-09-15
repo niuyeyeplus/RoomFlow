@@ -7,7 +7,8 @@ import { useMeetingStore } from '@/stores/meeting'
 import { useRoomStore } from '@/stores/room'
 import MeetingForm from '@/components/MeetingForm.vue'
 import EmptyState from '@/components/EmptyState.vue'
-import { MEETING_STATUS_TAG, MEETING_STATUS_TEXT } from '@/utils/format'
+import { useNow } from '@/composables/useNow'
+import { meetingStatusTag } from '@/utils/format'
 import { formatDateTime } from '@/utils/time'
 import type { ListMeetingsParams, MeetingStatusFilter, MeetingVO } from '@/types/api'
 
@@ -16,6 +17,9 @@ const meetingStore = useMeetingStore()
 const roomStore = useRoomStore()
 const { meetings, total, page, size, loading, error } = storeToRefs(meetingStore)
 const { rooms } = storeToRefs(roomStore)
+
+// 响应式时钟：状态徽章（未开始/进行中）越过开始时刻后自动刷新
+const now = useNow()
 
 const filters = reactive<{ roomId: number | null; date: string; status: MeetingStatusFilter | '' }>(
   {
@@ -126,12 +130,8 @@ onMounted(() => {
       <el-table-column prop="organizerUsername" label="发起人" width="110" />
       <el-table-column label="状态" width="110">
         <template #default="{ row }: { row: MeetingVO }">
-          <el-tag :type="MEETING_STATUS_TAG[row.status]" size="small">
-            {{
-              row.status === 'ENDED' && row.endedEarly
-                ? '已提前结束'
-                : MEETING_STATUS_TEXT[row.status]
-            }}
+          <el-tag :type="meetingStatusTag(row, now).type" size="small">
+            {{ meetingStatusTag(row, now).text }}
           </el-tag>
         </template>
       </el-table-column>
