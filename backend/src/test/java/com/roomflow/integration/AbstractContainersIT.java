@@ -1,6 +1,5 @@
 package com.roomflow.integration;
 
-import java.util.Set;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
@@ -24,14 +23,15 @@ public abstract class AbstractContainersIT {
       new GenericContainer<>(DockerImageName.parse("redis:8.2")).withExposedPorts(6379);
 
   // RabbitMQContainer defaults to vhost "/" plus the guest user, but the app connects to vhost
-  // "roomflow" as user "roomflow" (same topology as the dev middleware). Create the vhost and
-  // user explicitly and grant full configure/write/read permission on that vhost — without it
-  // every AMQP connection fails with 530 NOT_ALLOWED (vhost not found).
+  // "roomflow" as user "roomflow" (same topology as the dev middleware). Use the official image
+  // env vars: RABBITMQ_DEFAULT_VHOST makes "roomflow" the default user's home vhost, so the user
+  // is created at first boot with full permission on it — the deprecated withVhost/withUser/
+  // withPermission builder calls did not actually provision the user and broke PLAIN auth.
   protected static final RabbitMQContainer RABBIT =
       new RabbitMQContainer(DockerImageName.parse("rabbitmq:4.3"))
-          .withVhost("roomflow")
-          .withUser("roomflow", "roomflow", Set.of("roomflow"))
-          .withPermission("roomflow", "roomflow", ".*", ".*", ".*");
+          .withEnv("RABBITMQ_DEFAULT_USER", "roomflow")
+          .withEnv("RABBITMQ_DEFAULT_PASS", "roomflow")
+          .withEnv("RABBITMQ_DEFAULT_VHOST", "roomflow");
 
   static {
     MYSQL.start();
