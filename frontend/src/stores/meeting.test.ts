@@ -113,4 +113,102 @@ describe('meeting store', () => {
     await expect(store.leave(101)).rejects.toMatchObject({ code: 40909 })
     await expect(store.kick(101, 1002)).rejects.toMatchObject({ code: 40301 })
   })
+
+  it('updateMeeting syncs updated meeting into detail and list cache', async () => {
+    const updated: MeetingVO = { ...MEETING, title: '产品评审会（改期）' }
+    vi.mocked(meetingApi.updateMeeting).mockResolvedValue(updated)
+    const store = useMeetingStore()
+    store.meetings = [MEETING]
+    store.detail = DETAIL
+
+    const result = await store.updateMeeting(101, {
+      title: '产品评审会（改期）',
+      description: null,
+      roomId: 1,
+      startTime: MEETING.startTime,
+      endTime: MEETING.endTime
+    })
+
+    expect(meetingApi.updateMeeting).toHaveBeenCalledWith(
+      101,
+      expect.objectContaining({ title: '产品评审会（改期）' })
+    )
+    expect(result.title).toBe('产品评审会（改期）')
+    expect(store.detail?.title).toBe('产品评审会（改期）')
+    // participants 键不在 MeetingVO 中，合并后详情参会记录保留
+    expect(store.detail?.participants).toEqual([])
+    expect(store.meetings[0].title).toBe('产品评审会（改期）')
+  })
+
+  it('cancelMeeting marks meeting CANCELLED in cache', async () => {
+    const cancelled: MeetingVO = { ...MEETING, status: 'CANCELLED' }
+    vi.mocked(meetingApi.cancelMeeting).mockResolvedValue(cancelled)
+    const store = useMeetingStore()
+    store.meetings = [MEETING]
+    store.detail = DETAIL
+
+    await store.cancelMeeting(101)
+
+    expect(meetingApi.cancelMeeting).toHaveBeenCalledWith(101)
+    expect(store.detail?.status).toBe('CANCELLED')
+    expect(store.meetings[0].status).toBe('CANCELLED')
+  })
+
+  it('endMeetingEarly marks meeting ENDED with endedEarly flag', async () => {
+    const ended: MeetingVO = { ...MEETING, status: 'ENDED', endedEarly: true }
+    vi.mocked(meetingApi.endMeetingEarly).mockResolvedValue(ended)
+    const store = useMeetingStore()
+    store.detail = DETAIL
+
+    await store.endMeetingEarly(101)
+
+    expect(meetingApi.endMeetingEarly).toHaveBeenCalledWith(101)
+    expect(store.detail?.status).toBe('ENDED')
+    expect(store.detail?.endedEarly).toBe(true)
+  })
+
+  it('removeMeeting deletes from list and clears current detail', async () => {
+    vi.mocked(meetingApi.deleteMeeting).mockResolvedValue(null)
+    const store = useMeetingStore()
+    store.meetings = [MEETING]
+    store.detail = DETAIL
+
+    await store.removeMeeting(101)
+
+    expect(meetingApi.deleteMeeting).toHaveBeenCalledWith(101)
+    expect(store.meetings).toEqual([])
+    expect(store.detail).toBeNull()
+  })
+
+  it('removeMeeting decrements total only when the deleted row was in the list', async () => {
+    vi.mocked(meetingApi.deleteMeeting).mockResolvedValue(null)
+    const store = useMeetingStore()
+    store.meetings = [MEETING]
+    store.total = 5
+
+    await store.removeMeeting(101)
+    expect(store.total).toBe(4)
+
+    // 被删会议不在当前分页列表中（如详情页删除其他页数据）时不扣减
+    await store.removeMeeting(999)
+    expect(store.total).toBe(4)
+  })
+
+  it('lifecycle actions propagate ApiError to caller', async () => {
+    vi.mocked(meetingApi.updateMeeting).mockRejectedValue(new ApiError(40909, '状态不允许', 409))
+    vi.mocked(meetingApi.cancelMeeting).mockRejectedValue(new ApiError(40301, '无权限', 403))
+    vi.mocked(meetingApi.deleteMeeting).mockRejectedValue(new ApiError(40401, '不存在', 404))
+    vi.mocked(meetingApi.endMeetingEarly).mockRejectedValue(new ApiError(40909, '状态不允许', 409))
+    const store = useMeetingStore()
+    const req = {
+      title: 't',
+      roomId: 1,
+      startTime: MEETING.startTime,
+      endTime: MEETING.endTime
+    }
+    await expect(store.updateMeeting(101, req)).rejects.toMatchObject({ code: 40909 })
+    await expect(store.cancelMeeting(101)).rejects.toMatchObject({ code: 40301 })
+    await expect(store.removeMeeting(101)).rejects.toMatchObject({ code: 40401 })
+    await expect(store.endMeetingEarly(101)).rejects.toMatchObject({ code: 40909 })
+  })
 })

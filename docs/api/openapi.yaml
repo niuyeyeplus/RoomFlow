@@ -754,10 +754,13 @@ paths:
       description: |-
         修改会议信息（PUT 语义，提交完整字段）。仅发起人或 ADMIN。
         规则：
-        - 会议必须 status=ACTIVE，否则 40909；
-        - 未开始的会议（startTime > now）可修改全部字段：新时间须通过全部时间规则（40905），
-          换房间须启用（40906）且无冲突（40902），新房间 capacity 不得小于当前有效参会人数（40903）；
-        - 已开始未结束的会议仅允许修改 title / description；roomId、startTime、endTime 必须与原值一致，
+        - 会议不存在或 status=DELETED 返回 40401（与其他端点口径一致，不暴露删除痕迹）；
+          status 为 ENDED/CANCELLED 返回 40909；
+        - 未开始的会议（status=ACTIVE 且 startTime > now）可修改全部字段：新时间须通过全部时间规则（40905），
+          新房间须存在且已启用（40401/40906），同房间 `[start,end)` 冲突检测排除本会议自身（40902），
+          新房间 capacity 不得小于当前有效参会人数（40903）；
+        - 已开始的会议（status=ACTIVE 且 startTime <= now，含已过 endTime 但调度任务尚未结束的 ACTIVE 会议）
+          仅允许修改 title / description；roomId、startTime、endTime 必须与原值一致，
           否则 40909（此时服务端跳过时间与冲突校验）。
       x-permission: ORGANIZER_OR_ADMIN
       x-error-codes: [40001, 40002, 40101, 40102, 40301, 40401, 40902, 40903, 40905, 40906, 40909, 50000]
@@ -848,8 +851,9 @@ paths:
       summary: 取消会议
       description: |-
         取消会议：status 置为 CANCELLED，释放占用时段，会议仍可查看（链接显示已取消）。
-        仅发起人或 ADMIN；仅允许对“未开始的 ACTIVE 会议”（startTime > now）取消；
-        已开始的会议请使用 end-early；ENDED/CANCELLED/DELETED 状态返回 409 + code=40909。
+        仅发起人或 ADMIN；仅允许对“未开始的 ACTIVE 会议”（status=ACTIVE 且 startTime > now）取消；
+        已开始的会议请使用 end-early；ENDED/CANCELLED 状态返回 409 + code=40909；
+        会议不存在或 status=DELETED 返回 40401。
         无请求体。
       x-permission: ORGANIZER_OR_ADMIN
       x-error-codes: [40001, 40101, 40102, 40301, 40401, 40909, 50000]
@@ -901,7 +905,8 @@ paths:
       description: |-
         提前结束进行中的会议：status 置为 ENDED、endedEarly=true，立即释放剩余时段并停止报名。
         仅发起人或 ADMIN；仅允许当会议 status=ACTIVE 且 startTime <= now < endTime（进行中）时调用；
-        未开始的会议请使用 cancel，其他状态返回 409 + code=40909。无请求体。
+        未开始的会议请使用 cancel；ENDED/CANCELLED 状态返回 409 + code=40909；
+        会议不存在或 status=DELETED 返回 40401。无请求体。
       x-permission: ORGANIZER_OR_ADMIN
       x-error-codes: [40001, 40101, 40102, 40301, 40401, 40909, 50000]
       parameters:
@@ -1978,7 +1983,7 @@ components:
           description: '北京时间（+08:00）；晚于 startTime；15 分钟对齐；时长 15min–24h；可超出 72h 窗口、允许跨天'
     UpdateMeetingRequest:
       type: object
-      description: PUT 全量语义。未开始的会议可改全部字段；已开始会议仅 title/description 可变，其余字段须与原值一致
+      description: PUT 全量语义；description 省略视为 null。未开始的会议可改全部字段；已开始会议仅 title/description 可变，roomId/startTime/endTime 须与原值一致（否则 40909）
       required:
         - title
         - roomId

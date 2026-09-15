@@ -4,8 +4,11 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -156,5 +159,227 @@ class MeetingControllerTest extends ControllerTestSupport {
                         + "\"endTime\":\"2026-09-16T11:00:00+08:00\"}"))
         .andExpect(status().isConflict())
         .andExpect(jsonPath("$.code").value(40902));
+  }
+
+  // ---- PUT /api/meetings/{id} ----
+
+  private static final String UPDATE_BODY =
+      "{\"title\":\"评审（改）\",\"description\":\"d\",\"roomId\":1,"
+          + "\"startTime\":\"2026-09-16T14:00:00+08:00\","
+          + "\"endTime\":\"2026-09-16T15:00:00+08:00\"}";
+
+  @Test
+  void updateMeetingReturnsUpdated() throws Exception {
+    when(meetingService.update(any(), any(), any())).thenReturn(meetingVO());
+    mockMvc
+        .perform(
+            put("/api/meetings/101")
+                .header("Authorization", bearer(USER_TOKEN))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(UPDATE_BODY))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.id").value(101));
+  }
+
+  @Test
+  void updateMeetingRejectsMissingFields() throws Exception {
+    mockMvc
+        .perform(
+            put("/api/meetings/101")
+                .header("Authorization", bearer(USER_TOKEN))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"title\":\"\"}"))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value(40001));
+  }
+
+  @Test
+  void updateMeetingPropagatesForbiddenNotFoundAndState() throws Exception {
+    // doThrow().when() (not when().thenThrow()) so re-stubbing never invokes the prior
+    // throwing stub.
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.FORBIDDEN))
+        .when(meetingService)
+        .update(any(), any(), any());
+    mockMvc
+        .perform(
+            put("/api/meetings/101")
+                .header("Authorization", bearer(USER_TOKEN))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(UPDATE_BODY))
+        .andExpect(status().isForbidden())
+        .andExpect(jsonPath("$.code").value(40301));
+
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.NOT_FOUND))
+        .when(meetingService)
+        .update(any(), any(), any());
+    mockMvc
+        .perform(
+            put("/api/meetings/101")
+                .header("Authorization", bearer(USER_TOKEN))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(UPDATE_BODY))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.code").value(40401));
+
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.STATE_NOT_ALLOWED))
+        .when(meetingService)
+        .update(any(), any(), any());
+    mockMvc
+        .perform(
+            put("/api/meetings/101")
+                .header("Authorization", bearer(USER_TOKEN))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(UPDATE_BODY))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value(40909));
+  }
+
+  @Test
+  void updateMeetingPropagatesRoomAndTimeConflicts() throws Exception {
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.ROOM_DISABLED))
+        .when(meetingService)
+        .update(any(), any(), any());
+    mockMvc
+        .perform(
+            put("/api/meetings/101")
+                .header("Authorization", bearer(USER_TOKEN))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(UPDATE_BODY))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value(40906));
+
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.TIME_RULE))
+        .when(meetingService)
+        .update(any(), any(), any());
+    mockMvc
+        .perform(
+            put("/api/meetings/101")
+                .header("Authorization", bearer(USER_TOKEN))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(UPDATE_BODY))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value(40905));
+  }
+
+  // ---- PATCH /api/meetings/{id}/cancel ----
+
+  @Test
+  void cancelMeetingReturnsCancelled() throws Exception {
+    MeetingVO vo = meetingVO();
+    vo.setStatus(MeetingStatus.CANCELLED);
+    when(meetingService.cancel(any(), any())).thenReturn(vo);
+    mockMvc
+        .perform(patch("/api/meetings/101/cancel").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.status").value("CANCELLED"));
+  }
+
+  @Test
+  void cancelMeetingPropagates403404409() throws Exception {
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.FORBIDDEN))
+        .when(meetingService)
+        .cancel(any(), any());
+    mockMvc
+        .perform(patch("/api/meetings/101/cancel").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isForbidden())
+        .andExpect(jsonPath("$.code").value(40301));
+
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.NOT_FOUND))
+        .when(meetingService)
+        .cancel(any(), any());
+    mockMvc
+        .perform(patch("/api/meetings/101/cancel").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.code").value(40401));
+
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.STATE_NOT_ALLOWED))
+        .when(meetingService)
+        .cancel(any(), any());
+    mockMvc
+        .perform(patch("/api/meetings/101/cancel").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value(40909));
+  }
+
+  // ---- DELETE /api/meetings/{id} ----
+
+  @Test
+  void deleteMeetingReturnsOk() throws Exception {
+    mockMvc
+        .perform(delete("/api/meetings/101").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.code").value(0));
+  }
+
+  @Test
+  void deleteMeetingPropagates403And404() throws Exception {
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.FORBIDDEN))
+        .when(meetingService)
+        .delete(any(), any());
+    mockMvc
+        .perform(delete("/api/meetings/101").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isForbidden())
+        .andExpect(jsonPath("$.code").value(40301));
+
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.NOT_FOUND))
+        .when(meetingService)
+        .delete(any(), any());
+    mockMvc
+        .perform(delete("/api/meetings/101").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.code").value(40401));
+  }
+
+  // ---- PATCH /api/meetings/{id}/end-early ----
+
+  @Test
+  void endEarlyMeetingReturnsEnded() throws Exception {
+    MeetingVO vo = meetingVO();
+    vo.setStatus(MeetingStatus.ENDED);
+    vo.setEndedEarly(true);
+    when(meetingService.endEarly(any(), any())).thenReturn(vo);
+    mockMvc
+        .perform(patch("/api/meetings/101/end-early").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.status").value("ENDED"))
+        .andExpect(jsonPath("$.data.endedEarly").value(true));
+  }
+
+  @Test
+  void endEarlyMeetingPropagates403404409() throws Exception {
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.FORBIDDEN))
+        .when(meetingService)
+        .endEarly(any(), any());
+    mockMvc
+        .perform(patch("/api/meetings/101/end-early").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isForbidden())
+        .andExpect(jsonPath("$.code").value(40301));
+
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.NOT_FOUND))
+        .when(meetingService)
+        .endEarly(any(), any());
+    mockMvc
+        .perform(patch("/api/meetings/101/end-early").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.code").value(40401));
+
+    org.mockito.Mockito.doThrow(new BizException(ErrorCode.STATE_NOT_ALLOWED))
+        .when(meetingService)
+        .endEarly(any(), any());
+    mockMvc
+        .perform(patch("/api/meetings/101/end-early").header("Authorization", bearer(USER_TOKEN)))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value(40909));
+  }
+
+  @Test
+  void lifecycleEndpointsRejectAnonymous() throws Exception {
+    mockMvc.perform(patch("/api/meetings/101/cancel")).andExpect(status().isUnauthorized());
+    mockMvc.perform(delete("/api/meetings/101")).andExpect(status().isUnauthorized());
+    mockMvc.perform(patch("/api/meetings/101/end-early")).andExpect(status().isUnauthorized());
+    mockMvc
+        .perform(
+            put("/api/meetings/101").contentType(MediaType.APPLICATION_JSON).content(UPDATE_BODY))
+        .andExpect(status().isUnauthorized());
   }
 }
