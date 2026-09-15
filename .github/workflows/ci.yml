@@ -32,17 +32,11 @@ jobs:
           ./mvnw -B spotless:check
           ./mvnw -B compile spotbugs:check
 
-      - name: Test backend
+      - name: Test backend (unit tests + Testcontainers ITs via verify)
         working-directory: backend
         run: |
           chmod +x ./mvnw
-          ./mvnw -B clean test
-
-      - name: Generate JaCoCo coverage report
-        working-directory: backend
-        run: |
-          chmod +x ./mvnw
-          ./mvnw -B jacoco:report
+          ./mvnw -B clean verify
 
       - name: Upload JaCoCo coverage report
         uses: actions/upload-artifact@v4
