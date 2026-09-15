@@ -2,10 +2,14 @@
 -- Three preset meeting rooms and the initial ADMIN account.
 --
 -- The admin password hash is injected through the Flyway placeholder
--- ${admin-password-hash}, bound from spring.flyway.placeholders.admin-password-hash:
+-- admin-password-hash (used in the INSERT below), bound from
+-- spring.flyway.placeholders.admin-password-hash:
 --   dev          -> committed DEV-ONLY bootstrap hash (documented dev credential)
---   staging/prod -> ${ADMIN_PASSWORD_HASH} env var with NO default; a missing
+--   staging/prod -> ADMIN_PASSWORD_HASH env var with NO default; a missing
 --                   value fails property resolution so the app refuses to boot.
+-- NOTE: never write a dollar-sign+brace placeholder expression in a comment —
+-- Flyway's PlaceholderReplacingReader resolves them inside comments too and
+-- the migration fails if the name is not a configured placeholder.
 -- Known limitation: there is no change-password API (outside the API contract),
 -- so rotating the staging/prod admin credential means redeploying with a newly
 -- generated BCrypt hash.
