@@ -66,9 +66,9 @@ paths:
                 message: success
                 data:
                   tokenType: Bearer
-                  accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMDAxIn0.signature
+                  accessToken: <ACCESS_TOKEN>
                   accessTokenExpiresIn: 1800
-                  refreshToken: 4f8c2a1e-7b6d-4e9f-a2c3-1d5e6f7a8b9c
+                  refreshToken: <REFRESH_TOKEN>
                   refreshTokenExpiresIn: 2592000
         '400':
           $ref: '#/components/responses/BadRequest'
@@ -107,9 +107,9 @@ paths:
                 message: success
                 data:
                   tokenType: Bearer
-                  accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMDAxIn0.signature
+                  accessToken: <ACCESS_TOKEN>
                   accessTokenExpiresIn: 1800
-                  refreshToken: 4f8c2a1e-7b6d-4e9f-a2c3-1d5e6f7a8b9c
+                  refreshToken: <REFRESH_TOKEN>
                   refreshTokenExpiresIn: 2592000
         '400':
           $ref: '#/components/responses/BadRequest'
@@ -176,9 +176,9 @@ paths:
                 message: success
                 data:
                   tokenType: Bearer
-                  accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMDAxIn0.signature2
+                  accessToken: <ACCESS_TOKEN>
                   accessTokenExpiresIn: 1800
-                  refreshToken: 9a1b2c3d-4e5f-6a7b-8c9d-rotated-token
+                  refreshToken: <ROTATED_REFRESH_TOKEN>
                   refreshTokenExpiresIn: 2592000
         '400':
           $ref: '#/components/responses/BadRequest'
