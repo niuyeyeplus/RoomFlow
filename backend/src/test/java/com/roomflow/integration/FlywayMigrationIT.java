@@ -33,13 +33,21 @@ class FlywayMigrationIT extends AbstractContainersIT {
 
   @Test
   void seedsThreeRoomsAndAdmin() {
-    Integer rooms = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM room", Integer.class);
+    // ITs share one container database; other ITs may create extra rooms, so the seed
+    // assertions are scoped to the three V2 seed names instead of the table row count.
+    Integer rooms =
+        jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM room WHERE name IN ('301会议室','302会议室','多功能厅')", Integer.class);
     assertEquals(3, rooms);
     List<String> names =
-        jdbcTemplate.queryForList("SELECT name FROM room ORDER BY id", String.class);
+        jdbcTemplate.queryForList(
+            "SELECT name FROM room WHERE name IN ('301会议室','302会议室','多功能厅') ORDER BY id",
+            String.class);
     assertEquals(List.of("301会议室", "302会议室", "多功能厅"), names);
     List<Integer> capacities =
-        jdbcTemplate.queryForList("SELECT capacity FROM room ORDER BY id", Integer.class);
+        jdbcTemplate.queryForList(
+            "SELECT capacity FROM room WHERE name IN ('301会议室','302会议室','多功能厅') ORDER BY id",
+            Integer.class);
     assertEquals(List.of(8, 12, 20), capacities);
 
     String role =
