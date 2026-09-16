@@ -443,9 +443,12 @@ Generate the secret's contents from the host, using the same port you configured
 in `STAGING_SSH_PORT` (a non-default port changes the line to `[host]:port`):
 
 ```bash
-ssh-keyscan -p 22 staging.example.com > /tmp/staging-known-hosts-line
+ssh-keyscan -p 22 -t ed25519,ecdsa,rsa staging.example.com > /tmp/staging-known-hosts-line
 cat /tmp/staging-known-hosts-line     # sanity-check before storing
 gh secret set STAGING_KNOWN_HOSTS --env staging < /tmp/staging-known-hosts-line
+# -t is deliberate: ssh-keyscan's defaults may not return every host key type,
+# and a pin missing the type sshd prefers fails strict checking with
+# "No ED25519 host key is known for [host]:port" (seen on the first deploy).
 ```
 
 `ssh-keyscan` output is unauthenticated — verify the fingerprint out of band
@@ -1512,3 +1515,126 @@ as describing production behaviour: the staging workflow deploys automatically o
 merge, hosts a single stack, has no backup/restore step and no TLS. Anything
 production-specific — the confirmation gate, backups, the domain, HTTPS — belongs
 to that slice.
+
+---
+
+## 12. First deployment — acceptance record (2026-09-16)
+
+The first real staging deployment ran on 2026-09-16 against host
+`20.205.103.75` (SSH port 2222, deploy user `deploy`, deploy dir
+`/opt/roomflow/staging`, env file `.env.staging`). Record of what happened, what
+was fixed to get there, and what is still open.
+
+### Timeline and runs
+
+| Step | Result | Run / PR |
+| --- | --- | --- |
+| Staging machinery merged to `main` | merged | PR #6 (`dc4054e`) |
+| CI on `main` (images `dc4054e5db940688ffd33fcf66aa650c744e2db6` + `latest`) | success | [run 35108706172](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35108706172) |
+| Deploy `dc4054e5...` (workflow_run) | **success on attempt 4** — see failures below | [run 35109192206](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35109192206) |
+| E2E staging smoke against `dc4054e5...` | 1 pass after fixes | local run via SSH tunnel |
+| Test/healthcheck fixes merged | merged | PR #7 (`a59a3b7`) |
+| CI on `main` (images `a59a3b72f74f660a119bfe2b87fba7d200ddf9f4`) | success | [run 35113894247](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35113894247) |
+| Deploy `a59a3b72...` (workflow_run) | success; rollback target `dc4054e5...` captured | [run 35114343719](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35114343719) |
+| E2E staging smoke against `a59a3b72...` | 1 pass, 60s | local run via SSH tunnel |
+| Rollback verification: dispatch with `image_tag=38ff0a87df89d268d05c11159cb80b122f8eafc5` (valid SHA, no published image) | deploy failed as designed (remote exit 2); **automatic rollback restored `a59a3b72...` and verified healthy** | [run 35114626866](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35114626866) |
+
+Environment approvals were performed via the `pending_deployments` API by the
+required reviewer (`niuyeyeplus`; `prevent_self_review: false`). Every run above
+paused at the `staging` environment gate until approved — the gate works.
+
+### Failures hit on the first deploy and their fixes
+
+1. `STAGING_SSH_PORT` unset → defaulted to 22. Fixed: `gh variable set
+   STAGING_SSH_PORT --env staging --body "2222"` (now set at environment scope).
+2. `Host key verification failed` (`No ED25519 host key is known for
+   [host]:2222`): the stored `STAGING_KNOWN_HOSTS` pinned a key that did not
+   cover `[host]:2222` for ed25519 (ssh prefers ed25519; a pin listing only
+   another key type — or one recorded for a different port — fails strict
+   checking). Fixed by re-setting the secret to the full `ssh-keyscan -p 2222 -t
+   ed25519,ecdsa,rsa` output for the host. **Caveat:** the replacement was
+   produced by `ssh-keyscan` and cross-checked against a `known_hosts` entry
+   this machine recorded earlier for the same host; it was not verified against
+   a server-side fingerprint. Recommended: verify once out of band (e.g. cloud
+   console → `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
+   Runbook note: generate the pin with the real port (`ssh-keyscan -p <port>`)
+   and include `ed25519` — `ssh-keyscan` defaults may not return every type.
+3. `Load key ... error in libcrypto` then `Permission denied (publickey)`:
+   `STAGING_SSH_PRIVATE_KEY` was corrupted at upload (the local OpenSSH ed25519
+   key loads fine). Fixed by re-uploading the key bytes verbatim.
+   The deploy user's `authorized_keys` and host prerequisites
+   (`deploy` user, `docker` group, `/opt/roomflow/staging`, `.env.staging`)
+   were then provisioned on the host per §4 — they did not exist yet.
+
+### Health check result
+
+On the successful deploys the on-host check (`docker/health-check.sh`) reported
+`backend http://127.0.0.1:18080/actuator/health -> HTTP 200, top-level status
+UP` and `frontend http://127.0.0.1:8081/ -> HTTP 200, non-blank body` on the
+first attempt. On the host: all five `roomflow-staging-*` containers
+`healthy`, Flyway applied migrations 1–3 cleanly (including `seed rooms`), and
+the seeded `admin` login works (BCrypt hash written single-quoted — the
+interpolation pitfall in §4.5 did not bite). The dev stack on the same host was
+untouched throughout.
+
+### Rollback verification
+
+`gh workflow run deploy-staging.yml -f image_tag=38ff0a87...` (a commit that CI
+never built): `docker compose up -d` failed on the host with remote exit 2, the
+health-check step was skipped, the rollback step ran, redeployed the previous
+tag `a59a3b72...` and re-verified it healthy (`ROLLBACK_HEALTH=healthy`).
+Post-check on the host confirmed backend + frontend healthy on `a59a3b72...`.
+This is the designed behaviour; the run correctly ends red while the host is
+left healthy on the previous tag.
+
+### E2E acceptance
+
+`npm run test:e2e:staging` with `PLAYWRIGHT_BASE_URL=http://localhost:8081`
+(browser traffic via `ssh -L 8081:127.0.0.1:8081` tunnel to the staging host —
+the documented access path) and an env-only `STAGING_E2E_PASSWORD`:
+
+`staging-smoke` — **PASS** (2 runs: `dc4054e5...` and `a59a3b72...`).
+Covers: register (API) → UI login → create meeting → second user 报名 →
+organizer PARTICIPANT_JOINED notification → mark-read in UI.
+
+**Coverage gaps vs the broader acceptance list** — NOT covered by the staging
+spec today: room management UI (the spec only lists rooms via API to pick one),
+meeting lifecycle transitions (start/end/cancel — only covered by
+`meeting-lifecycle.spec.ts` in the dev suite, not on staging), and any
+admin-only flows. Do not read the smoke pass as covering those.
+
+### Issues found by the acceptance run (fixed in PR #7)
+
+- `frontend/tests/e2e/helpers.ts` `fillTimeRange` still targeted the removed
+  `.el-range-editor` — MeetingForm.vue uses two `el-date-picker
+  type="datetime"` inputs since `fb0a974`. The staging spec timed out on the
+  create-meeting dialog; fixed by filling `开始时间`/`结束时间` inputs.
+  **Same staleness affects the dev specs** (`meeting-flow.spec.ts`,
+  `meeting-lifecycle.spec.ts` share the helper) — re-verify them on the dev
+  stack; the invalid-time cases in `meeting-flow` may need further adjustment.
+- `docker-compose.staging.yml` frontend healthcheck probed
+  `http://localhost:80/`; in `nginx:alpine` `localhost` resolves to `::1` while
+  nginx listens on IPv4 only → container reported `unhealthy` while serving
+  HTTP 200. Now probes `127.0.0.1:80`.
+- Browser calls to the API carried `Origin: http://localhost:8081` (the tunnel
+  URL), which `CORS_ALLOWED_ORIGINS` rejected with 403 → login failed in the
+  browser while Node-side API calls worked. Added `http://localhost:8081` to
+  `CORS_ALLOWED_ORIGINS` on the host (kept alongside the public origin).
+
+### Still open
+
+- **Frontend public reachability**: `0.0.0.0:8081` is bound by docker-proxy but
+  port 8081 was not reachable from this machine — likely NSG/firewall. Until it
+  is opened (or a domain/TLS is fronted), the UI is reachable only through an
+  SSH tunnel, and staging E2E must run via a tunnel or on the host.
+- **`.env.staging` provenance**: generated on the host during first-deploy
+  provisioning (random hex secrets, single-quoted BCrypt admin hash). It is
+  operator-owned; rotate any value that should not have passed through the
+  orchestrator's session.
+- **`STAGING_E2E_PASSWORD`** was supplied ad hoc for the acceptance runs, not
+  stored anywhere; set it (env or CI secret) wherever future staging E2E runs.
+- Backend healthcheck still uses `localhost:8080` inside the container — it
+  resolves correctly in the JRE image today, but `127.0.0.1` would be more
+  robust for the same reason as the frontend fix.
+- Dev-suite specs sharing `fillTimeRange` were not re-run against the dev
+  stack here.
