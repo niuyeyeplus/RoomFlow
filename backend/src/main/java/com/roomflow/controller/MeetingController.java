@@ -6,6 +6,7 @@ import com.roomflow.common.result.Result;
 import com.roomflow.domain.meeting.CreateMeetingRequest;
 import com.roomflow.domain.meeting.MeetingDetailVO;
 import com.roomflow.domain.meeting.MeetingVO;
+import com.roomflow.domain.meeting.UpdateMeetingRequest;
 import com.roomflow.security.SecurityUtils;
 import com.roomflow.service.MeetingService;
 import jakarta.validation.Valid;
@@ -15,18 +16,18 @@ import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-/**
- * Slice-1 scope: list/detail/create only. PUT/cancel/DELETE/end-early are contract-defined but
- * intentionally implemented in the meeting-lifecycle slice (PR-4).
- */
+/** Meeting lifecycle API: list/detail/create plus update/cancel/delete/end-early. */
 @RestController
 @RequestMapping("/api/meetings")
 @Validated
@@ -61,5 +62,28 @@ public class MeetingController {
       @Valid @RequestBody CreateMeetingRequest request) {
     return ResponseEntity.status(HttpStatus.CREATED)
         .body(Result.ok(meetingService.create(request, SecurityUtils.currentAccount())));
+  }
+
+  /** Organizer-or-admin check happens in the service (needs the meeting's organizerId). */
+  @PutMapping("/{id}")
+  public Result<MeetingVO> update(
+      @PathVariable @Min(1) Long id, @Valid @RequestBody UpdateMeetingRequest request) {
+    return Result.ok(meetingService.update(id, request, SecurityUtils.currentAccount()));
+  }
+
+  @PatchMapping("/{id}/cancel")
+  public Result<MeetingVO> cancel(@PathVariable @Min(1) Long id) {
+    return Result.ok(meetingService.cancel(id, SecurityUtils.currentAccount()));
+  }
+
+  @DeleteMapping("/{id}")
+  public Result<Void> delete(@PathVariable @Min(1) Long id) {
+    meetingService.delete(id, SecurityUtils.currentAccount());
+    return Result.ok();
+  }
+
+  @PatchMapping("/{id}/end-early")
+  public Result<MeetingVO> endEarly(@PathVariable @Min(1) Long id) {
+    return Result.ok(meetingService.endEarly(id, SecurityUtils.currentAccount()));
   }
 }

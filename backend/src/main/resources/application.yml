@@ -23,6 +23,16 @@ spring:
           multiplier: 2.0
         default-requeue-rejected: false
 
+roomflow:
+  scheduler:
+    # Meeting end sweep; ShedLock+Redis makes it single-executor across instances.
+    enabled: true
+    interval: 60s
+    lock-at-most: PT5M
+    # Held nearly one full interval so a second instance skips each cycle instead of
+    # re-running a redundant (idempotent but wasted) sweep right after the winner releases.
+    lock-at-least: PT50S
+
 server:
   port: 8080
 
