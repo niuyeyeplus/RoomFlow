@@ -77,14 +77,14 @@ const form = reactive<{
   title: string
   description: string
   roomId: number | null
-  timeRange: [Date, Date] | null
+  startTime: Date | null
+  endTime: Date | null
 }>({
   title: props.meeting?.title ?? '',
   description: props.meeting?.description ?? '',
   roomId: props.meeting?.roomId ?? null,
-  timeRange: props.meeting
-    ? [new Date(props.meeting.startTime), new Date(props.meeting.endTime)]
-    : null
+  startTime: props.meeting ? new Date(props.meeting.startTime) : null,
+  endTime: props.meeting ? new Date(props.meeting.endTime) : null
 })
 
 const enabledRooms = computed(() => roomList.value.filter((r) => r.enabled))
@@ -117,30 +117,38 @@ function roomLabel(room: RoomVO): string {
   return room.enabled ? base : `${base}（已停用）`
 }
 
-/** 起止时间规则校验，返回错误文案或 null（供 EP rules 与提交门控共用） */
-function checkTimeRange(value: [Date, Date] | null): string | null {
-  if (!value || value.length !== 2 || !value[0] || !value[1]) {
-    return '请选择会议起止时间'
-  }
-  const [start, end] = value
+/** 开始时间规则校验，返回错误文案或 null（供 EP rules 与提交门控共用） */
+function checkStartTime(value: Date | null): string | null {
+  if (!value) return '请选择开始时间'
   // el-date-picker 可能携带非零秒/毫秒；就地归一化使校验与提交一致（契约要求秒=0）
-  start.setSeconds(0, 0)
-  end.setSeconds(0, 0)
+  value.setSeconds(0, 0)
   const now = Date.now()
-  if (!isQuarterAligned(start) || !isQuarterAligned(end)) {
+  if (!isQuarterAligned(value)) {
     return '起止时间须按15分钟对齐（分钟须为 00/15/30/45）'
   }
-  if (start.getTime() < now) return '开始时间不能早于当前时间'
-  if (start.getTime() > now + BOOKING_WINDOW_MS) return '开始时间须在当前时间之后72小时内'
+  if (value.getTime() < now) return '开始时间不能早于当前时间'
+  if (value.getTime() > now + BOOKING_WINDOW_MS) return '开始时间须在当前时间之后72小时内'
+  return null
+}
+
+/** 结束时间规则校验：除自身必填/对齐外，校验与开始时间的先后与时长关系 */
+function checkEndTime(start: Date | null, end: Date | null): string | null {
+  if (!end) return '请选择结束时间'
+  end.setSeconds(0, 0)
+  if (!isQuarterAligned(end)) {
+    return '起止时间须按15分钟对齐（分钟须为 00/15/30/45）'
+  }
+  // 开始时间缺失或自身不合法时，先后/时长错误由开始时间项承担，避免重复提示
+  if (!start || checkStartTime(start) !== null) return null
   if (end.getTime() <= start.getTime()) return '结束时间须晚于开始时间'
   if (end.getTime() - start.getTime() < MIN_DURATION_MS) return '会议时长不能少于15分钟'
   if (end.getTime() - start.getTime() > MAX_DURATION_MS) return '会议时长不能超过24小时'
   return null
 }
 
-function validateTimeRange(
+function validateStartTime(
   _rule: unknown,
-  value: [Date, Date] | null,
+  value: Date | null,
   callback: (error?: Error) => void
 ): void {
   // 已开始会议锁定时间字段且提交原值，不做新时间规则校验
@@ -148,8 +156,38 @@ function validateTimeRange(
     callback()
     return
   }
-  const message = checkTimeRange(value)
+  const message = checkStartTime(value)
   callback(message ? new Error(message) : undefined)
+}
+
+function validateEndTime(
+  _rule: unknown,
+  value: Date | null,
+  callback: (error?: Error) => void
+): void {
+  if (timeLocked.value) {
+    callback()
+    return
+  }
+  const message = checkEndTime(form.startTime, value)
+  callback(message ? new Error(message) : undefined)
+}
+
+/** 分钟下拉仅保留 00/15/30/45；对齐规则仍由校验兜底（手动输入可绕过 UI 约束） */
+function quarterDisabledMinutes(): number[] {
+  const disabled: number[] = []
+  for (let m = 0; m < 60; m += 1) {
+    if (m % 15 !== 0) disabled.push(m)
+  }
+  return disabled
+}
+
+/** 结束时间日历：禁用早于开始时间所在日的日期（开始未选时不限制） */
+function disabledEndDate(d: Date): boolean {
+  const start = form.startTime
+  if (!start) return false
+  const startDay = new Date(start.getFullYear(), start.getMonth(), start.getDate())
+  return d.getTime() < startDay.getTime()
 }
 
 const rules: FormRules = {
@@ -159,11 +197,21 @@ const rules: FormRules = {
   ],
   description: [{ max: 5000, message: '说明最长5000字', trigger: 'blur' }],
   roomId: [{ required: true, message: '请选择会议室', trigger: 'change' }],
-  timeRange: [{ required: true, validator: validateTimeRange, trigger: 'change' }]
+  startTime: [{ required: true, validator: validateStartTime, trigger: 'change' }],
+  endTime: [{ required: true, validator: validateEndTime, trigger: 'change' }]
 }
 
 function clearServerError(field: string): void {
   delete serverErrors[field]
+}
+
+/** 开始时间变化：结束时间的先后/时长校验依赖它，重校验以刷新提示 */
+function onStartTimeChange(): void {
+  clearServerError('startTime')
+  clearServerError('endTime')
+  if (form.endTime && !timeLocked.value) {
+    formRef.value?.validateField('endTime').catch(() => false)
+  }
 }
 
 /** 提交前的显式校验：错误写入 serverErrors，经 el-form-item :error 展示 */
@@ -186,9 +234,14 @@ function runLocalValidation(): boolean {
     ok = false
   }
   if (!isLockedNow()) {
-    const timeError = checkTimeRange(form.timeRange)
-    if (timeError) {
-      serverErrors.timeRange = timeError
+    const startError = checkStartTime(form.startTime)
+    if (startError) {
+      serverErrors.startTime = startError
+      ok = false
+    }
+    const endError = checkEndTime(form.startTime, form.endTime)
+    if (endError) {
+      serverErrors.endTime = endError
       ok = false
     }
   }
@@ -198,7 +251,7 @@ function runLocalValidation(): boolean {
 async function submit(): Promise<void> {
   // 浏览器环境下同步触发 EP 校验渲染；提交门控以显式校验为准
   formRef.value?.validate().catch(() => false)
-  if (!runLocalValidation() || !form.timeRange || form.roomId === null) return
+  if (!runLocalValidation() || !form.startTime || !form.endTime || form.roomId === null) return
   const m = props.meeting
   // PUT 全量语义：已开始会议回传原 roomId/startTime/endTime（不一致后端返回 40909）；
   // 锁定态以提交瞬间现算，避免时钟刷新粒度漏判“跨过开始时刻”的提交
@@ -207,8 +260,8 @@ async function submit(): Promise<void> {
     title: form.title.trim(),
     description: form.description.trim() || null,
     roomId: locked && m ? m.roomId : form.roomId,
-    startTime: locked && m ? m.startTime : toBeijingIso(form.timeRange[0]),
-    endTime: locked && m ? m.endTime : toBeijingIso(form.timeRange[1])
+    startTime: locked && m ? m.startTime : toBeijingIso(form.startTime),
+    endTime: locked && m ? m.endTime : toBeijingIso(form.endTime)
   }
   submitting.value = true
   try {
@@ -220,10 +273,9 @@ async function submit(): Promise<void> {
     emit('success', meeting)
   } catch (e) {
     if (e instanceof ApiError && e.code === 40001 && e.fieldErrors.length > 0) {
-      // 字段级错误映射回表单：startTime/endTime 归到 timeRange
+      // 字段级错误映射回表单：startTime/endTime 与表单项 prop 一一对应
       for (const fe of e.fieldErrors) {
-        const field = fe.field === 'startTime' || fe.field === 'endTime' ? 'timeRange' : fe.field
-        serverErrors[field] = fe.message
+        serverErrors[fe.field] = fe.message
       }
     } else {
       ElMessage.error(friendlyMessage(e))
@@ -305,22 +357,40 @@ onMounted(() => {
         </el-option>
       </el-select>
     </el-form-item>
-    <el-form-item label="起止时间" prop="timeRange" :error="serverErrors.timeRange">
-      <el-date-picker
-        v-model="form.timeRange"
-        type="datetimerange"
-        range-separator="至"
-        start-placeholder="开始时间"
-        end-placeholder="结束时间"
-        format="YYYY-MM-DD HH:mm"
-        :disabled="timeLocked"
-        class="full-width"
-        @change="clearServerError('timeRange')"
-      />
-      <div v-if="!timeLocked" class="time-hint">
-        开始时间须在当前时间之后、72小时窗口内；起止时间按15分钟对齐；时长15分钟至24小时，允许跨天
-      </div>
-    </el-form-item>
+    <el-row :gutter="12">
+      <el-col :span="12">
+        <el-form-item label="开始时间" prop="startTime" :error="serverErrors.startTime">
+          <el-date-picker
+            v-model="form.startTime"
+            type="datetime"
+            placeholder="开始时间"
+            format="YYYY-MM-DD HH:mm"
+            :disabled="timeLocked"
+            :disabled-minutes="quarterDisabledMinutes"
+            class="full-width"
+            @change="onStartTimeChange"
+          />
+        </el-form-item>
+      </el-col>
+      <el-col :span="12">
+        <el-form-item label="结束时间" prop="endTime" :error="serverErrors.endTime">
+          <el-date-picker
+            v-model="form.endTime"
+            type="datetime"
+            placeholder="结束时间"
+            format="YYYY-MM-DD HH:mm"
+            :disabled="timeLocked"
+            :disabled-minutes="quarterDisabledMinutes"
+            :disabled-date="disabledEndDate"
+            class="full-width"
+            @change="clearServerError('endTime')"
+          />
+        </el-form-item>
+      </el-col>
+    </el-row>
+    <div v-if="!timeLocked" class="time-hint">
+      开始时间须在当前时间之后、72小时窗口内；起止时间按15分钟对齐；时长15分钟至24小时，允许跨天
+    </div>
     <el-form-item>
       <el-button type="primary" :loading="submitting" native-type="submit">
         {{ isEdit ? '保存修改' : '创建会议' }}
@@ -343,6 +413,7 @@ onMounted(() => {
   font-size: 12px;
 }
 .time-hint {
+  margin: -6px 0 18px;
   font-size: 12px;
   color: var(--el-text-color-secondary);
   line-height: 1.6;

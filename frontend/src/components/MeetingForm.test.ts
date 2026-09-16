@@ -106,6 +106,13 @@ function toIso(d: Date): string {
   )
 }
 
+/** 表单内两个独立 datetime picker：[0]=开始时间，[1]=结束时间 */
+function timePickers(wrapper: ReturnType<typeof mountForm>) {
+  const pickers = wrapper.findAllComponents(ElDatePicker)
+  expect(pickers).toHaveLength(2)
+  return pickers
+}
+
 describe('MeetingForm', () => {
   beforeEach(() => {
     pinia = createPinia()
@@ -133,9 +140,9 @@ describe('MeetingForm', () => {
     await wrapper.find('input').setValue('评审会')
     await wrapper.findComponent(ElSelect).vm.$emit('update:modelValue', 1)
     const past = new Date(Date.now() - 60 * 60 * 1000)
-    await wrapper
-      .findComponent(ElDatePicker)
-      .vm.$emit('update:modelValue', [past, new Date(past.getTime() + 3600 * 1000)])
+    const [startPicker, endPicker] = timePickers(wrapper)
+    await startPicker.vm.$emit('update:modelValue', past)
+    await endPicker.vm.$emit('update:modelValue', new Date(past.getTime() + 3600 * 1000))
     await wrapper.find('form').trigger('submit')
     await flushPromises()
     expect(meetingApi.createMeeting).not.toHaveBeenCalled()
@@ -147,9 +154,9 @@ describe('MeetingForm', () => {
     await wrapper.find('input').setValue('短会')
     await wrapper.findComponent(ElSelect).vm.$emit('update:modelValue', 1)
     const start = new Date(Math.ceil((Date.now() + 3600 * 1000) / 900000) * 900000)
-    await wrapper
-      .findComponent(ElDatePicker)
-      .vm.$emit('update:modelValue', [start, new Date(start.getTime() + 5 * 60 * 1000)])
+    const [startPicker, endPicker] = timePickers(wrapper)
+    await startPicker.vm.$emit('update:modelValue', start)
+    await endPicker.vm.$emit('update:modelValue', new Date(start.getTime() + 5 * 60 * 1000))
     await wrapper.find('form').trigger('submit')
     await flushPromises()
     expect(meetingApi.createMeeting).not.toHaveBeenCalled()
@@ -162,7 +169,9 @@ describe('MeetingForm', () => {
     await wrapper.find('input').setValue('评审会')
     await wrapper.findComponent(ElSelect).vm.$emit('update:modelValue', 1)
     const [start, end] = futureRange()
-    await wrapper.findComponent(ElDatePicker).vm.$emit('update:modelValue', [start, end])
+    const [startPicker, endPicker] = timePickers(wrapper)
+    await startPicker.vm.$emit('update:modelValue', start)
+    await endPicker.vm.$emit('update:modelValue', end)
     await wrapper.find('form').trigger('submit')
     await flushPromises()
 
@@ -244,7 +253,9 @@ describe('MeetingForm', () => {
 
     // 房间与时间字段禁用，且出现“仅可修改标题与说明”提示
     expect(wrapper.findComponent(ElSelect).props('disabled')).toBe(true)
-    expect(wrapper.findComponent(ElDatePicker).props('disabled')).toBe(true)
+    for (const p of timePickers(wrapper)) {
+      expect(p.props('disabled')).toBe(true)
+    }
     expect(wrapper.text()).toContain('仅可修改会议标题与说明')
 
     await wrapper.find('input').setValue('改名')
@@ -282,7 +293,9 @@ describe('MeetingForm', () => {
 
       // 打开弹窗时尚未开始：房间/时间字段可编辑
       expect(wrapper.findComponent(ElSelect).props('disabled')).toBe(false)
-      expect(wrapper.findComponent(ElDatePicker).props('disabled')).toBe(false)
+      for (const p of timePickers(wrapper)) {
+        expect(p.props('disabled')).toBe(false)
+      }
 
       // 推进时钟跨过开始时刻（start 距 now 最远约 +17min，推进 20min 确保越过）
       vi.advanceTimersByTime(20 * 60 * 1000)
@@ -290,7 +303,9 @@ describe('MeetingForm', () => {
 
       // 锁定态自动刷新：字段禁用并出现提示
       expect(wrapper.findComponent(ElSelect).props('disabled')).toBe(true)
-      expect(wrapper.findComponent(ElDatePicker).props('disabled')).toBe(true)
+      for (const p of timePickers(wrapper)) {
+        expect(p.props('disabled')).toBe(true)
+      }
       expect(wrapper.text()).toContain('仅可修改会议标题与说明')
 
       await wrapper.find('input').setValue('只改标题')
