@@ -2,8 +2,11 @@ package com.roomflow.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.roomflow.common.enums.MeetingStatus;
+import com.roomflow.common.enums.NotificationType;
+import com.roomflow.common.enums.Role;
 import com.roomflow.common.exception.BizException;
 import com.roomflow.common.exception.ErrorCode;
 import com.roomflow.common.result.PageResult;
@@ -15,6 +18,8 @@ import com.roomflow.domain.meeting.CreateMeetingRequest;
 import com.roomflow.domain.meeting.Meeting;
 import com.roomflow.domain.meeting.MeetingDetailVO;
 import com.roomflow.domain.meeting.MeetingVO;
+import com.roomflow.domain.meeting.UpdateMeetingRequest;
+import com.roomflow.domain.notification.NotificationMessage;
 import com.roomflow.domain.participant.Participant;
 import com.roomflow.domain.participant.ParticipantVO;
 import com.roomflow.domain.room.Room;
@@ -22,27 +27,38 @@ import com.roomflow.mapper.AccountMapper;
 import com.roomflow.mapper.MeetingMapper;
 import com.roomflow.mapper.ParticipantMapper;
 import com.roomflow.mapper.RoomMapper;
+import com.roomflow.mq.NotificationProducer;
 import com.roomflow.security.LoginAccount;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 @Service
 public class MeetingService {
 
+  private static final Logger log = LoggerFactory.getLogger(MeetingService.class);
   private static final int MAX_PAGE_SIZE = 100;
+  private static final DateTimeFormatter NOTIFY_TIME =
+      DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
   private final MeetingMapper meetingMapper;
   private final RoomMapper roomMapper;
   private final AccountMapper accountMapper;
   private final ParticipantMapper participantMapper;
+  private final NotificationProducer notificationProducer;
   private final Clock clock;
 
   public MeetingService(
@@ -50,11 +66,13 @@ public class MeetingService {
       RoomMapper roomMapper,
       AccountMapper accountMapper,
       ParticipantMapper participantMapper,
+      NotificationProducer notificationProducer,
       Clock clock) {
     this.meetingMapper = meetingMapper;
     this.roomMapper = roomMapper;
     this.accountMapper = accountMapper;
     this.participantMapper = participantMapper;
+    this.notificationProducer = notificationProducer;
     this.clock = clock;
   }
 
@@ -212,6 +230,288 @@ public class MeetingService {
     participantMapper.insert(organizer);
 
     return MeetingVO.from(meeting, room.getName(), current.username(), 1);
+  }
+
+  /**
+   * PUT full update. Not-yet-started meetings may change every field (full time rules 40905, room
+   * exists 40401 / enabled 40906, [start,end) conflict excluding self 40902, new-room capacity vs
+   * active participants 40903 — in that order). Started meetings (startTime &lt;= now, including
+   * expired-but-unswept ACTIVE rows) may only change title/description; any
+   * roomId/startTime/endTime difference is rejected with 40909 and time/conflict checks are
+   * skipped.
+   */
+  @Transactional(rollbackFor = Exception.class)
+  public MeetingVO update(Long id, UpdateMeetingRequest request, LoginAccount current) {
+    Meeting meeting = requireVisibleMeetingForUpdate(id);
+    requireOrganizerOrAdmin(meeting, current);
+    if (meeting.getStatus() != MeetingStatus.ACTIVE) {
+      throw new BizException(ErrorCode.STATE_NOT_ALLOWED);
+    }
+    // Wire-format check applies to both branches (40001); it is a format rule, not a 40905
+    // time rule, so it is still enforced for started meetings.
+    TimeRules.requireBeijingOffset(request.getStartTime(), "startTime");
+    TimeRules.requireBeijingOffset(request.getEndTime(), "endTime");
+
+    LocalDateTime now = LocalDateTime.now(clock);
+    if (!meeting.getStartTime().isAfter(now)) {
+      // Already started: only title/description are mutable; schedule fields must match exactly.
+      if (!request.getRoomId().equals(meeting.getRoomId())
+          || !BeijingTime.toLocal(request.getStartTime()).equals(meeting.getStartTime())
+          || !BeijingTime.toLocal(request.getEndTime()).equals(meeting.getEndTime())) {
+        throw new BizException(ErrorCode.STATE_NOT_ALLOWED);
+      }
+      meeting.setTitle(request.getTitle());
+      meeting.setDescription(request.getDescription());
+      meeting.setUpdatedAt(now.truncatedTo(ChronoUnit.SECONDS));
+      // Explicit SET via LambdaUpdateWrapper: updateById's default NOT_NULL field strategy would
+      // silently skip a null description, but PUT full-update semantics require an omitted
+      // description to clear the column. update(null, wrapper) also bypasses
+      // MetaObjectHandler.updateFill, so updated_at is set manually (same second truncation).
+      meetingMapper.update(
+          null,
+          new LambdaUpdateWrapper<Meeting>()
+              .eq(Meeting::getId, meeting.getId())
+              .set(Meeting::getTitle, meeting.getTitle())
+              .set(Meeting::getDescription, meeting.getDescription())
+              .set(Meeting::getUpdatedAt, meeting.getUpdatedAt()));
+      return toVO(meeting);
+    }
+
+    // Not started: full update path.
+    TimeRules.validateMeetingWindow(
+        request.getStartTime(), request.getEndTime(), Instant.now(clock));
+
+    // FOR UPDATE locks the (possibly new) room row so the conflict check below serializes
+    // against concurrent create/update on the same room (TOCTOU).
+    Room room =
+        roomMapper.selectOne(
+            new LambdaQueryWrapper<Room>().eq(Room::getId, request.getRoomId()).last("FOR UPDATE"));
+    if (room == null) {
+      throw new BizException(ErrorCode.NOT_FOUND);
+    }
+    boolean roomChanged = !room.getId().equals(meeting.getRoomId());
+    if (roomChanged && Boolean.FALSE.equals(room.getEnabled())) {
+      throw new BizException(ErrorCode.ROOM_DISABLED);
+    }
+
+    LocalDateTime start = BeijingTime.toLocal(request.getStartTime());
+    LocalDateTime end = BeijingTime.toLocal(request.getEndTime());
+    Long conflicts =
+        meetingMapper.selectCount(
+            new LambdaQueryWrapper<Meeting>()
+                .eq(Meeting::getRoomId, room.getId())
+                .eq(Meeting::getStatus, MeetingStatus.ACTIVE)
+                // Exclude this meeting: its stored slot is being replaced.
+                .ne(Meeting::getId, meeting.getId())
+                .lt(Meeting::getStartTime, end)
+                .gt(Meeting::getEndTime, start));
+    if (conflicts != null && conflicts > 0) {
+      throw new BizException(ErrorCode.TIME_CONFLICT);
+    }
+
+    if (roomChanged) {
+      Long activeCount = countActiveParticipants(meeting.getId());
+      int capacity = room.getCapacity() == null ? 0 : room.getCapacity();
+      if (activeCount != null && activeCount > capacity) {
+        throw new BizException(ErrorCode.CAPACITY_FULL);
+      }
+    }
+
+    meeting.setTitle(request.getTitle());
+    meeting.setDescription(request.getDescription());
+    meeting.setRoomId(room.getId());
+    meeting.setStartTime(start);
+    meeting.setEndTime(end);
+    meeting.setUpdatedAt(LocalDateTime.now(clock).truncatedTo(ChronoUnit.SECONDS));
+    // Same explicit-SET rationale as the started branch: a null description must reach the
+    // column (PUT full update), and updated_at is written manually because updateFill does
+    // not run for update(null, wrapper).
+    meetingMapper.update(
+        null,
+        new LambdaUpdateWrapper<Meeting>()
+            .eq(Meeting::getId, meeting.getId())
+            .set(Meeting::getTitle, meeting.getTitle())
+            .set(Meeting::getDescription, meeting.getDescription())
+            .set(Meeting::getRoomId, meeting.getRoomId())
+            .set(Meeting::getStartTime, meeting.getStartTime())
+            .set(Meeting::getEndTime, meeting.getEndTime())
+            .set(Meeting::getUpdatedAt, meeting.getUpdatedAt()));
+    return toVO(meeting);
+  }
+
+  /**
+   * Cancels a not-yet-started ACTIVE meeting: status -&gt; CANCELLED (visible but slot released,
+   * since conflict detection only counts ACTIVE). No notification per contract.
+   */
+  @Transactional(rollbackFor = Exception.class)
+  public MeetingVO cancel(Long id, LoginAccount current) {
+    Meeting meeting = requireVisibleMeetingForUpdate(id);
+    requireOrganizerOrAdmin(meeting, current);
+    if (meeting.getStatus() != MeetingStatus.ACTIVE
+        || !meeting.getStartTime().isAfter(LocalDateTime.now(clock))) {
+      throw new BizException(ErrorCode.STATE_NOT_ALLOWED);
+    }
+    meeting.setStatus(MeetingStatus.CANCELLED);
+    meetingMapper.updateById(meeting);
+    return toVO(meeting);
+  }
+
+  /**
+   * Logical delete: status -&gt; DELETED (row kept; participant/notification history preserved).
+   * Any non-DELETED status may be deleted; afterwards the meeting is invisible everywhere.
+   */
+  @Transactional(rollbackFor = Exception.class)
+  public void delete(Long id, LoginAccount current) {
+    Meeting meeting = requireVisibleMeetingForUpdate(id);
+    requireOrganizerOrAdmin(meeting, current);
+    meeting.setStatus(MeetingStatus.DELETED);
+    meetingMapper.updateById(meeting);
+  }
+
+  /**
+   * Ends an in-progress meeting early: status -&gt; ENDED with endedEarly=true, releases the
+   * remaining slot and stops joins (status no longer ACTIVE). Requires startTime &lt;= now &lt;
+   * endTime; once now == endTime the scheduler owns the transition (40909). Sends MEETING_ENDED to
+   * all active participants after commit.
+   */
+  @Transactional(rollbackFor = Exception.class)
+  public MeetingVO endEarly(Long id, LoginAccount current) {
+    Meeting meeting = requireVisibleMeetingForUpdate(id);
+    requireOrganizerOrAdmin(meeting, current);
+    LocalDateTime now = LocalDateTime.now(clock);
+    if (meeting.getStatus() != MeetingStatus.ACTIVE
+        || meeting.getStartTime().isAfter(now)
+        || !now.isBefore(meeting.getEndTime())) {
+      throw new BizException(ErrorCode.STATE_NOT_ALLOWED);
+    }
+    meeting.setStatus(MeetingStatus.ENDED);
+    meeting.setEndedEarly(true);
+    meetingMapper.updateById(meeting);
+    notifyMeetingEnded(meeting, "会议「" + meeting.getTitle() + "」已提前结束。");
+    return toVO(meeting);
+  }
+
+  /** Ids of ACTIVE meetings whose endTime has passed — the scheduler's sweep candidates. */
+  public List<Long> findOverdueActiveMeetingIds(LocalDateTime now) {
+    return meetingMapper
+        .selectList(
+            new LambdaQueryWrapper<Meeting>()
+                .select(Meeting::getId)
+                .eq(Meeting::getStatus, MeetingStatus.ACTIVE)
+                .le(Meeting::getEndTime, now))
+        .stream()
+        .map(Meeting::getId)
+        .toList();
+  }
+
+  /**
+   * Atomically transitions one overdue meeting ACTIVE -&gt; ENDED (endedEarly stays false) via a
+   * conditional UPDATE guarded on status='ACTIVE'. Returns true only for the caller that won the
+   * transition, so racing end-early/delete/concurrent sweeps can never double-end or double-notify.
+   * Each call runs in its own transaction (invoked through the proxy by the scheduler) so one
+   * failing meeting cannot roll back the whole sweep.
+   */
+  @Transactional(rollbackFor = Exception.class)
+  public boolean endMeetingIfActive(Long meetingId) {
+    LocalDateTime now = LocalDateTime.now(clock);
+    int updated =
+        meetingMapper.update(
+            null,
+            new LambdaUpdateWrapper<Meeting>()
+                .eq(Meeting::getId, meetingId)
+                .eq(Meeting::getStatus, MeetingStatus.ACTIVE)
+                .le(Meeting::getEndTime, now)
+                .set(Meeting::getStatus, MeetingStatus.ENDED)
+                // update(null, wrapper) bypasses MetaObjectHandler.updateFill, so refresh
+                // updated_at here with the same second truncation the handler applies.
+                .set(Meeting::getUpdatedAt, now.truncatedTo(ChronoUnit.SECONDS)));
+    if (updated == 0) {
+      return false;
+    }
+    Meeting meeting = meetingMapper.selectById(meetingId);
+    notifyMeetingEnded(
+        meeting,
+        "会议「" + meeting.getTitle() + "」已于 " + meeting.getEndTime().format(NOTIFY_TIME) + " 结束。");
+    return true;
+  }
+
+  /**
+   * Sends MEETING_ENDED to every active participant (left_at IS NULL), organizer included. The
+   * deterministic messageId doubles as the consumer-side idempotency key, so a redelivery or a
+   * near-simultaneous second publish cannot create duplicate notifications.
+   */
+  private void notifyMeetingEnded(Meeting meeting, String content) {
+    List<Participant> actives =
+        participantMapper.selectList(
+            new LambdaQueryWrapper<Participant>()
+                .eq(Participant::getMeetingId, meeting.getId())
+                .isNull(Participant::getLeftAt));
+    for (Participant participant : actives) {
+      publishAfterCommit(
+          new NotificationMessage(
+              "meeting-ended:" + meeting.getId() + ":" + participant.getAccountId(),
+              participant.getAccountId(),
+              NotificationType.MEETING_ENDED,
+              "会议已结束",
+              content,
+              meeting.getId()));
+    }
+  }
+
+  /**
+   * Delays the MQ publish until the transaction commits, so a later commit failure cannot leave a
+   * phantom notification and a rollback never publishes. Publish failures are caught and logged — a
+   * lost notification must not turn a committed state change into a 500.
+   */
+  private void publishAfterCommit(NotificationMessage message) {
+    if (TransactionSynchronizationManager.isSynchronizationActive()) {
+      TransactionSynchronizationManager.registerSynchronization(
+          new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+              sendQuietly(message);
+            }
+          });
+    } else {
+      // No surrounding transaction (e.g. direct unit-test invocation): send immediately.
+      sendQuietly(message);
+    }
+  }
+
+  private void sendQuietly(NotificationMessage message) {
+    try {
+      notificationProducer.send(message);
+    } catch (RuntimeException e) {
+      log.error(
+          "Failed to publish {} notification for meeting {}",
+          message.type(),
+          message.meetingId(),
+          e);
+    }
+  }
+
+  private void requireOrganizerOrAdmin(Meeting meeting, LoginAccount current) {
+    if (current.role() != Role.ADMIN && !meeting.getOrganizerId().equals(current.id())) {
+      throw new BizException(ErrorCode.FORBIDDEN);
+    }
+  }
+
+  private Long countActiveParticipants(Long meetingId) {
+    return participantMapper.selectCount(
+        new LambdaQueryWrapper<Participant>()
+            .eq(Participant::getMeetingId, meetingId)
+            .isNull(Participant::getLeftAt));
+  }
+
+  private MeetingVO toVO(Meeting meeting) {
+    Room room = meeting.getRoomId() == null ? null : roomMapper.selectById(meeting.getRoomId());
+    Account organizer = accountMapper.selectById(meeting.getOrganizerId());
+    Long activeCount = countActiveParticipants(meeting.getId());
+    return MeetingVO.from(
+        meeting,
+        room == null ? null : room.getName(),
+        organizer == null ? null : organizer.getUsername(),
+        activeCount == null ? 0 : activeCount.intValue());
   }
 
   /** Counts active participants (left_at IS NULL) per meeting in one grouped query. */

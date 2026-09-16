@@ -3,6 +3,7 @@ package com.roomflow.integration;
 import java.io.IOException;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.TestPropertySource;
 import org.testcontainers.containers.Container;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.MySQLContainer;
@@ -12,7 +13,13 @@ import org.testcontainers.utility.DockerImageName;
 /**
  * Shared real-middleware containers for integration tests. Bound to failsafe (*IT) so they only run
  * under `mvnw verify` (CI); surefire never picks them up, keeping `mvnw test` Docker-free.
+ *
+ * <p>The meeting-end sweep is disabled by default: ITs that create expired ACTIVE meetings must not
+ * race a background scheduler rewriting their rows mid-assertion. MeetingLifecycleIT is the one
+ * exception — it re-enables the scheduler with a short interval (subclass @TestPropertySource
+ * properties override these).
  */
+@TestPropertySource(properties = "roomflow.scheduler.enabled=false")
 public abstract class AbstractContainersIT {
 
   protected static final MySQLContainer<?> MYSQL =

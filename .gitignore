@@ -34,3 +34,6 @@ logs/
 
 # Local agent orchestration artifacts (session-only, not committed)
 .claude/
+
+# Agent gate-run artifacts (exit-code captures)
+*.exit

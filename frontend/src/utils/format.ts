@@ -1,5 +1,11 @@
 ﻿// 展示文案映射（中文简洁企业风）
-import type { Equipment, LeaveReason, MeetingStatus, NotificationType } from '@/types/api'
+import type {
+  Equipment,
+  LeaveReason,
+  MeetingStatus,
+  MeetingVO,
+  NotificationType
+} from '@/types/api'
 
 export const MEETING_STATUS_TEXT: Record<MeetingStatus, string> = {
   ACTIVE: '有效',
@@ -15,6 +21,28 @@ export const MEETING_STATUS_TAG: Record<MeetingStatus, 'success' | 'info' | 'war
     CANCELLED: 'warning',
     DELETED: 'danger'
   }
+
+export type TagType = 'primary' | 'success' | 'info' | 'warning' | 'danger'
+
+/**
+ * 会议状态徽章：ACTIVE 按当前时间细分未开始/进行中；
+ * ENDED 区分正常结束与提前结束；CANCELLED/DELETED 按状态文案展示。
+ * DELETED 对普通用户不可见，不会真实出现。
+ */
+export function meetingStatusTag(
+  meeting: Pick<MeetingVO, 'status' | 'endedEarly' | 'startTime'>,
+  now: number = Date.now()
+): { text: string; type: TagType } {
+  if (meeting.status === 'ACTIVE') {
+    return new Date(meeting.startTime).getTime() <= now
+      ? { text: '进行中', type: 'primary' }
+      : { text: '未开始', type: 'success' }
+  }
+  if (meeting.status === 'ENDED') {
+    return { text: meeting.endedEarly ? '已提前结束' : '已结束', type: 'info' }
+  }
+  return { text: MEETING_STATUS_TEXT[meeting.status], type: MEETING_STATUS_TAG[meeting.status] }
+}
 
 export const EQUIPMENT_TEXT: Record<Equipment, string> = {
   PROJECTOR: '投影仪',
