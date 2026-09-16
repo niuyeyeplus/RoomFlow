@@ -374,14 +374,22 @@ export async function uiLogout(page: Page): Promise<void> {
   await page.waitForURL('**/login**', { timeout: 60_000 })
 }
 
-/** Fill the el-date-picker datetimerange inside the create-meeting dialog. */
+/**
+ * Fill the two separate el-date-picker type="datetime" inputs inside the
+ * create-meeting dialog (MeetingForm.vue: 开始时间 and 结束时间 are individual
+ * pickers since the meeting-lifecycle UI split the old datetimerange editor).
+ */
 export async function fillTimeRange(page: Page, start: Date, end: Date): Promise<void> {
   const dialog = page.locator('.el-dialog:visible')
-  const inputs = dialog.locator('.el-range-editor .el-range-input')
-  await inputs.nth(0).click()
-  await inputs.nth(0).fill(fmtPicker(start))
-  await inputs.nth(1).fill(fmtPicker(end))
-  // Enter applies the typed range and closes the picker panel. Do NOT press
+  const startInput = dialog.locator('input[placeholder="开始时间"]')
+  const endInput = dialog.locator('input[placeholder="结束时间"]')
+  await startInput.click()
+  await startInput.fill(fmtPicker(start))
+  // Enter commits the typed datetime and closes that picker's panel.
+  await page.keyboard.press('Enter')
+  await endInput.click()
+  await endInput.fill(fmtPicker(end))
+  // Enter applies the typed value and closes the picker panel. Do NOT press
   // Escape here: once the panel is closed it would propagate to el-dialog and
   // close the whole create-meeting dialog.
   await page.keyboard.press('Enter')
