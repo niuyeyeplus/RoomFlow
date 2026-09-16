@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.staging.example
 *.pem
 *.key
 
@@ -30,6 +31,9 @@ logs/
 # Devin local session artifacts
 .devin/cache/
 .devin/logs/
+
+# Local agent orchestration artifacts (session-only, not committed)
+.claude/
 
 # Agent gate-run artifacts (exit-code captures)
 *.exit
