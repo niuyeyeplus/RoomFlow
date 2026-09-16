@@ -30,3 +30,6 @@ logs/
 # Devin local session artifacts
 .devin/cache/
 .devin/logs/
+
+# Agent gate-run artifacts (exit-code captures)
+*.exit
