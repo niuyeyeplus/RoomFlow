@@ -31,3 +31,6 @@ logs/
 # Devin local session artifacts
 .devin/cache/
 .devin/logs/
+
+# Local agent orchestration artifacts (session-only, not committed)
+.claude/
