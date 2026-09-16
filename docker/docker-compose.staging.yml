@@ -1,0 +1,362 @@
+# RoomFlow STAGING container stack (single staging host).
+#
+# This stack is INDEPENDENT of the dev stack in docker/docker-compose.yml.
+# The two are designed to be able to run side by side on the same host without
+# sharing a single network, volume, container name or host port.
+#
+# Usage — always run from the REPOSITORY ROOT:
+#   cp .env.staging.example .env.staging   # then fill in every CHANGE_ME
+#   IMAGE_TAG=<40-char git sha> \
+#   docker compose --project-directory . --env-file .env.staging \
+#     -f docker/docker-compose.staging.yml up -d
+#
+# `.env.staging` MUST exist before the command above: it is gitignored, so a
+# fresh clone does not have one, and --env-file fails fast with a clear error
+# when the path is missing (rather than silently interpolating empty secrets).
+#
+# Why --project-directory/.env-file are required:
+#   Compose resolves ${VAR} interpolation from the shell environment and the
+#   .env file in the *project directory*, which defaults to the directory
+#   containing the first -f compose file (docker/). Running
+#   `docker compose -f docker/docker-compose.staging.yml up` from the repo root
+#   makes Compose look for docker/.env — which does not exist — so
+#   ${DB_PASSWORD} etc. interpolate to empty strings and MySQL/Redis refuse to
+#   start. --project-directory . makes the repo root the project directory so
+#   .env.staging is found; --env-file .env.staging is explicit and fails fast
+#   if the file is missing. See docker/README.md.
+#
+# NOTE: no `env_file:` directive is used. Every variable each service needs is
+# mapped explicitly in its `environment:` block below. env_file: ../.env.staging
+# is deliberately avoided because (a) it does NOT feed ${VAR} interpolation
+# anyway, and (b) a missing file is a hard error on Compose < v2.24 (which lacks
+# the `required: false` long syntax).
+#
+# NOTE: SPRING_PROFILES_ACTIVE is hardcoded to `staging` (not a variable with a
+# default) on purpose. The dev compose uses
+# ${SPRING_PROFILES_ACTIVE:?must be set explicitly (dev|staging|prod)} so one
+# file can drive several profiles; this staging file has exactly one job, and
+# hardcoding removes the failure mode where a misconfigured pipeline exports
+# SPRING_PROFILES_ACTIVE=dev and boots the staging box with the dev profile.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# READ THIS BEFORE EDITING .env.staging: SINGLE-QUOTE ANY VALUE CONTAINING '$'
+# ─────────────────────────────────────────────────────────────────────────────
+# Compose interpolates an --env-file value a SECOND time: the file is read,
+# then ${...} inside the VALUES is expanded as well. That second pass applies
+# to UNQUOTED and DOUBLE-QUOTED values; a SINGLE-quoted value is exempt, which
+# is the whole reason it is the recommended form below. In an unquoted or
+# double-quoted value an unescaped dollar sign therefore turns something that
+# looks non-empty in the file into an empty or wrong value by the time it
+# reaches a container — and the ${VAR:?...} guards below cannot catch that,
+# because they test what the env file supplied, not what the supplied text
+# expands to. Whether a guard can be defeated this way depends on the Compose
+# version's interpolation order (Compose v2 re-expands env-file values), so do
+# not rely on the guard alone.
+#
+# RECOMMENDED — single-quote the whole value. Compose takes a single-quoted
+# env-file value LITERALLY: the quotes are stripped and nothing inside them is
+# expanded, so the value the container receives is exactly the value that was
+# typed. This is the form that is correct regardless of Compose version, which
+# is why it is the default recommendation:
+#
+#   RIGHT:  REDIS_PASSWORD='$tr0ub4dor'
+#           ADMIN_PASSWORD_HASH='$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy'
+#
+# ALTERNATIVE — escape every literal '$' as '$$'. '$$' is Compose's own escape
+# and collapses back to a single literal '$'. It is valid, but it is the
+# version-dependent option: it depends on the double-interpolation semantics
+# described above, so whether '$$' means "one literal dollar" or survives as
+# two characters is decided by the Compose version in use. Prefer single
+# quotes when there is a choice:
+#
+#   OK:     REDIS_PASSWORD=$$tr0ub4dor
+#
+# WRONG — leave the '$' bare, or wrap the value in DOUBLE quotes. Both forms
+# are re-interpolated, so the '$' is taken as the start of a variable
+# reference:
+#
+#   WRONG:  REDIS_PASSWORD=$tr0ub4dor    -> expands to the (unset) variable
+#                                           "tr0ub4dor" -> empty password
+#   WRONG:  REDIS_PASSWORD="$tr0ub4dor"  -> the same: double quotes do NOT
+#                                           protect the value from expansion
+#
+# FALLBACK — keep the value out of this file entirely and export it from the
+# shell before invoking Compose: an exported variable is already interpolated
+# and is never re-expanded by Compose.
+#
+# This bites realistic values, not just contrived ones: BCrypt hashes
+# (ADMIN_PASSWORD_HASH is $2a$10$...) and randomly generated secrets both
+# contain '$'. Which variables this is dangerous for, and what stops each:
+#   * REDIS_PASSWORD      — an empty password makes redis-server start with NO
+#                           authentication. The redis `command:` below refuses
+#                           to start when the value it actually received is
+#                           empty, so this fails loudly instead of silently.
+#   * ADMIN_PASSWORD_HASH — the value most likely to be written wrongly of all
+#                           of them, because a BCrypt hash ALWAYS contains '$'.
+#                           See the dedicated note on that variable below for
+#                           the full symptom -> cause -> fix chain.
+#   * JWT_SECRET          — an empty signing key. The backend fails at startup
+#                           on a too-short HMAC key, and the health check then
+#                           fails, so the deploy is rolled back rather than run.
+#   * DB_PASSWORD / MYSQL_ROOT_PASSWORD / RABBITMQ_PASSWORD — the MySQL and
+#                           RabbitMQ entrypoints refuse to initialise with an
+#                           empty credential on a fresh volume. RABBITMQ_USERNAME
+#                           is guarded too, but a mangled username is far less
+#                           likely: it is a plain word, not a secret.
+#
+# Every one of these still carries its own ${VAR:?...} guard below, and those
+# guards DO catch a variable that is missing or empty in the file. What no
+# compose guard can catch is a value that is non-empty in the file but
+# re-interpolates to empty or to something else — that case is caught by the
+# Redis runtime check above, by the backend's own startup failure, or by
+# nothing at all. The quoting rule itself is repeated in .env.staging.example
+# and docker/README.md so it is visible wherever a value gets typed.
+
+name: roomflow-staging
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: roomflow-staging-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-roomflow}
+      MYSQL_USER: ${DB_USERNAME:-roomflow}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?must be set in .env.staging}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?must be set in .env.staging}
+    # Bound to loopback only: staging middleware is reachable exclusively via
+    # an SSH tunnel, never from the public interface. See docker/README.md.
+    ports:
+      - "127.0.0.1:${STAGING_DB_PORT:-13307}:3306"
+    volumes:
+      # Staging-only named volume. Never point this at the dev `mysql-data`
+      # volume: the two stacks have separate lifecycles and separate data.
+      - staging-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root --password=$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - staging-net
+
+  redis:
+    image: redis:8.2-alpine
+    container_name: roomflow-staging-redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?must be set in .env.staging}
+    # $$ escapes Compose interpolation: the container's own env is expanded by
+    # sh at runtime, so `docker inspect` shows the literal "$REDIS_PASSWORD" in
+    # Config.Cmd instead of the plaintext password.
+    # HONEST CAVEAT (same accepted trade-off as the dev stack, and NOT a full
+    # secret-store solution): the value is still present in the container's
+    # environment block (docker inspect .Config.Env) and in `ps` output. Moving
+    # to Docker secrets / a mounted redis.conf is the follow-up for anything
+    # more sensitive than a staging box.
+    #
+    # The `test -n` in front is the staging-only hardening described in the
+    # header: `${REDIS_PASSWORD:?...}` proves the env FILE has a value, but if
+    # that value contains an unescaped '$' it can still expand to nothing by the
+    # time it reaches this container, and `redis-server --requirepass ""` is a
+    # Redis with NO authentication that is reachable from anything on the
+    # staging-net bridge. Refusing to start turns that silent hole into an
+    # immediately visible crash-loop. `exec` keeps redis-server as PID 1 so it
+    # still gets SIGTERM directly from `compose stop`/`restart`.
+    # The message deliberately contains no '$' of its own, so the wording cannot
+    # be mangled by the very interpolation it warns about.
+    #
+    # NOTE: that message still reads "double every dollar sign in .env.staging".
+    # It is part of the container's command payload, so it is left
+    # byte-identical here rather than reworded; the advice it points at — the
+    # header of this file — is where the current rule lives, and it recommends
+    # SINGLE-QUOTING the value, with '$$'-escaping documented as the
+    # alternative form.
+    command:
+      - sh
+      - -c
+      - >-
+        test -n "$$REDIS_PASSWORD" || { echo "roomflow-staging: REDIS_PASSWORD is empty after
+        Compose interpolation - double every dollar sign in .env.staging, see the header of
+        docker-compose.staging.yml" >&2; exit 1; };
+        exec redis-server --requirepass "$$REDIS_PASSWORD"
+    ports:
+      - "127.0.0.1:${STAGING_REDIS_PORT:-16380}:6379"
+    volumes:
+      - staging-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - staging-net
+
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    container_name: roomflow-staging-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:?must be set in .env.staging}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?must be set in .env.staging}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-roomflow}
+    # Loopback-only: AMQP and the management UI are operator-facing ports;
+    # reach them through an SSH tunnel (see docker/README.md).
+    ports:
+      - "127.0.0.1:${STAGING_RABBITMQ_PORT:-15674}:5672"
+      - "127.0.0.1:${STAGING_RABBITMQ_MGMT_PORT:-15675}:15672"
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - staging-net
+
+  backend:
+    # IMMUTABLE PIN — deliberately different from the dev stack, which uses
+    # `${IMAGE_TAG:-latest}`. The `:-` form silently falls back to the mutable
+    # `latest` tag when IMAGE_TAG is unset, which for staging means a deploy can
+    # quietly run an image nobody intended. The `:?` form is fail-fast: Compose
+    # aborts with a clear error before creating anything unless IMAGE_TAG is
+    # set, and CI passes the 40-char git sha that docker-build-push tagged.
+    image: ghcr.io/niuyeyeplus/roomflow-backend:${IMAGE_TAG:?must be set to an immutable tag, e.g. the git sha}
+    container_name: roomflow-staging-backend
+    restart: unless-stopped
+    environment:
+      # Hardcoded, not interpolated — see the header comment.
+      SPRING_PROFILES_ACTIVE: staging
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-roomflow}
+      DB_USERNAME: ${DB_USERNAME:-roomflow}
+      DB_PASSWORD: ${DB_PASSWORD:?must be set in .env.staging}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?must be set in .env.staging}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:?must be set in .env.staging}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?must be set in .env.staging}
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST:-roomflow}
+      # application-staging.yml resolves the JWT signing key as
+      # ${ROOMFLOW_JWT_SECRET:${JWT_SECRET}} — ROOMFLOW_JWT_SECRET wins when
+      # present, otherwise JWT_SECRET is used. We pass JWT_SECRET only (same
+      # name the dev compose passes), so a single secret drives both stacks and
+      # there is no second, half-configured variable to get out of sync.
+      JWT_SECRET: ${JWT_SECRET:?must be set in .env.staging}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-30d}
+      # ── STARTUP-CRITICAL ─────────────────────────────────────────────────
+      # application-staging.yml declares the Flyway placeholder
+      # `admin-password-hash: ${ADMIN_PASSWORD_HASH}` with NO default, and
+      # Flyway resolves placeholders while migrating at boot. The dev compose
+      # does NOT pass this variable at all — copying that omission here would
+      # make the staging backend die during startup, before the health endpoint
+      # ever answers, and the container would restart-loop. It must therefore be
+      # present in .env.staging and is passed through unguarded only by the
+      # ${VAR:?...} guard below. The value is a BCrypt hash produced offline
+      # (never a plaintext password).
+      #
+      # ── ADMIN_PASSWORD_HASH IS THE VALUE MOST LIKELY TO BE WRITTEN WRONGLY ─
+      # A BCrypt hash ALWAYS contains '$' (it looks like $2a$10$N9qo...), so it
+      # is the value the re-interpolation described in the header is most likely
+      # to damage — and a damaged hash need not be an empty one. Write it
+      # SINGLE-QUOTED in .env.staging ('$2a$10$...'): the header explains why
+      # that form is correct regardless of Compose version and why '$$'-escaping
+      # is only the alternative.
+      #
+      # The deploy's pre-flight check does NOT stop a bad value: a
+      # BCrypt-SHAPED unescaped value is reported as a WARNING and the deploy
+      # PROCEEDS (see .github/scripts/staging-deploy-lib.sh), precisely because
+      # this is the one value an operator cannot reasonably write any other way.
+      # Symptom -> cause -> fix, so it can be diagnosed in a single pass:
+      #
+      #   SYMPTOM  the deploy waits out the whole health-check budget and then
+      #            fails and is rolled back.
+      #   CAUSE    the value that reached the container is not the value that was
+      #            written. If it ended up empty, the backend dies while it is
+      #            still starting, so /actuator/health never answers; `restart:
+      #            unless-stopped` then restart-loops the container, `frontend`
+      #            is held back by its `depends_on: backend: condition:
+      #            service_healthy`, and docker/health-check.sh polls two URLs
+      #            that cannot come up until its timeout expires.
+      #            A hash that is mangled but still non-empty can instead let the
+      #            backend boot and seed the `admin` account with a hash that
+      #            matches no password anyone knows; the health check passes and
+      #            nothing rolls back, but the admin login is broken — which is
+      #            why the fix below matters even on an apparently green deploy.
+      #   FIX      write the hash single-quoted in .env.staging, re-deploy, then
+      #            `... logs backend` to confirm the startup error is gone (or,
+      #            in the second case, log in as `admin` to confirm the hash).
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?must be a BCrypt hash generated offline - staging backend fails at startup without it}
+      # ── Also required for a usable staging box ───────────────────────────
+      # CORS_ALLOWED_ORIGINS would NOT fail startup (application-staging.yml
+      # declares it as ${CORS_ALLOWED_ORIGINS:}, i.e. defaulting to empty = no
+      # cross-origin requests allowed). It is guarded here anyway so every
+      # staging deploy states its allowed origins explicitly instead of
+      # silently shipping a stack whose browsers reject the SPA's API calls.
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?must list the staging SPA origin(s), comma-separated}
+    # Backend is exposed on loopback as well (deploy-time health checks and SSH
+    # tunnels). nginx reaches it over the internal staging-net network.
+    ports:
+      - "127.0.0.1:${STAGING_BACKEND_PORT:-18080}:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    # /actuator/health is permitAll in SecurityConfig. The runner image is
+    # eclipse-temurin:21-jre-alpine, which has no curl — use BusyBox wget
+    # (non-zero exit on HTTP error).
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks:
+      - staging-net
+
+  frontend:
+    # Same immutable-pin rule as the backend above.
+    image: ghcr.io/niuyeyeplus/roomflow-frontend:${IMAGE_TAG:?must be set to an immutable tag, e.g. the git sha}
+    container_name: roomflow-staging-frontend
+    restart: unless-stopped
+    # The frontend is the public entry point of the staging box, so its host
+    # port is the one port that is configurable and NOT loopback-bound. The
+    # default (8081) deliberately avoids the dev stack's port 80.
+    ports:
+      - "${STAGING_FRONTEND_PORT:-8081}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    # The nginx image is alpine: no curl, but BusyBox wget is present. `-q`
+    # suppresses progress, `-O /dev/null` discards the body, and the explicit
+    # `|| exit 1` guarantees a non-zero exit whenever wget fails (busybox wget
+    # also exits non-zero on an HTTP error status, but the guard makes the
+    # intent unambiguous).
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:80/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - staging-net
+
+volumes:
+  # Explicitly staging-prefixed: these must never resolve to the dev stack's
+  # `mysql-data` / `redis-data` volumes. Combined with `name: roomflow-staging`
+  # above, the fully-qualified names are roomflow-staging_staging-mysql-data
+  # and roomflow-staging_staging-redis-data.
+  staging-mysql-data:
+  staging-redis-data:
+
+networks:
+  # Project-scoped (roomflow-staging_staging-net), so it cannot be joined by
+  # containers from the dev project.
+  staging-net:
+    driver: bridge

@@ -1,0 +1,48 @@
+# RoomFlow line-ending policy.
+#
+# WHY THIS FILE EXISTS
+#   This repository is developed on Windows workstations, where the global
+#   gitconfig sets `core.autocrlf=true`, and deployed by shipping files to a
+#   LINUX staging host that runs them. With no attributes, a Windows checkout of
+#   docker/health-check.sh contains CRLF and the host therefore reads the second
+#   line as `set -euo pipefail\r` — an invalid shell option — so the post-deploy
+#   health check dies instantly. The deploy step then reports the new release as
+#   unhealthy and rolls it back: a CRLF checkout could roll back a perfectly good
+#   deploy. `eol=lf` makes the checked-out bytes identical on every OS.
+#
+# SCOPE
+#   Deliberately narrow: only the text files this deployment actually executes,
+#   parses, or feeds to `docker compose --env-file`. There is intentionally NO
+#   blanket `* text=auto` rule — that would renormalise every file in the
+#   repository and produce a large, unrelated diff; this change does not rewrite
+#   the repo's line endings.
+#
+#   Deliberately NOT included: `*.md` (docs are rendered by GitHub, which handles
+#   CRLF), and the frontend/Java sources (their toolchains are line-ending
+#   agnostic, and neither is copied straight into a shell or a config parser).
+#   Binary files are untouched — the patterns below are all text extensions.
+#
+# `text` + `eol=lf` normalises on commit as well: the blob is stored with LF and
+# every future checkout gets LF, on Windows included.
+
+# Executed by bash on the staging host, via `bash docker/health-check.sh` and
+# over SSH. CRLF here is the failure mode described above.
+*.sh text eol=lf
+
+# Compose files, the GitHub Actions deploy workflow, and other YAML. Parsed on
+# the runner and on the Linux host.
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# .env templates (.env.staging.example is the tracked staging template). A stray
+# CR would end up INSIDE an interpolated value — e.g. a password or a BCrypt
+# hash — and silently change the secret.
+*.example text eol=lf
+
+# docker/nginx.conf is COPYed into the frontend image and read by nginx on
+# Linux, where a trailing CR becomes part of the directive value.
+*.conf text eol=lf
+
+# Keep the policy files themselves LF so they stay portable.
+.gitattributes text eol=lf
+.gitignore text eol=lf
