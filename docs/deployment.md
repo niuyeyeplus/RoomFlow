@@ -1792,3 +1792,30 @@ through the tunnel with `TZ=UTC` on the Node side — **2/2 passed** (lifecycle
 not possible: the `staging` environment's branch policy allows `main` only —
 correct protection, not bypassed. A green 6/6 Actions run follows once PR #10
 merges and the deploy chain re-triggers.
+
+### Post-fix chain: deploy `76527bd` — full green (2026-09-17)
+
+PR #10 merged as `76527bd`; the automated chain then ran end to end on real
+infrastructure with no manual steps beyond the two environment approvals:
+
+| Stage | Run | Result |
+| --- | --- | --- |
+| CI on `main` (`76527bd`) | [35206835640](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35206835640) | 4/4 jobs success |
+| `Deploy Staging` | [35207238469](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35207238469) | `workflow_run` trigger, environment approval granted, tag `76527bd1…d1e45d6c8` deployed, host healthy; all 5 staging containers `healthy` (verified on-host) |
+| `E2E Staging` | [35207472106](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35207472106) | auto-triggered via `workflow_run`, environment approval granted, **6/6 passed in 21.6m** |
+
+Per-test results (run `35207472106`, GitHub-hosted `ubuntu-latest` runner —
+Ubuntu 24.04 image `ubuntu24/20260907.300`, UTC; the same runner family that
+exposed the TZ bug): `admin room management` 13.8s, `normal user rejected`
+6.6s, `meeting lifecycle` 17.9s, `participant flows` 38.4s,
+`real-time lifecycle` 19.9m (auto-end observed 19s after the end boundary on
+the real 60s sweep), `staging-smoke` 18.3s.
+
+Leak scan of run `35207472106`: 0 JWT/private-key hits in the full job log,
+every secret echo masked as `***` by Actions, and **no artifacts were
+uploaded** (the upload step is `if: failure()` only), so nothing retained can
+carry a credential.
+
+This run is the authoritative acceptance result for the expanded staging
+suite: all 12 acceptance items green in a single automated Actions chain on
+the real staging stack.
