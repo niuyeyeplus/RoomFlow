@@ -226,8 +226,7 @@ class MeetingLifecycleIT extends AbstractContainersIT {
         () -> endNotificationsFor(m.getId(), user.getId()) == 1,
         "end notification for active participant");
     awaitTrue(
-        () -> endNotificationsFor(m.getId(), admin.id()) == 1,
-        "end notification for organizer");
+        () -> endNotificationsFor(m.getId(), admin.id()) == 1, "end notification for organizer");
     // The user who left is never a publish target at all, and both real messages are
     // already consumed, so zero is a stable assertion here.
     assertEquals(0, endNotificationsFor(m.getId(), left.getAccountId()));
