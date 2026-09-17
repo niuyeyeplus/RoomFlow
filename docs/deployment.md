@@ -1503,16 +1503,203 @@ the whole file rather than quietly taking effect.
 
 ---
 
-## 11. Production (forward pointer)
+## 11. Production
 
-Production deployment is a **separate later slice, `PR-6`
-(`feat/production-deploy`)**, which per `PLAN.md` adds manual confirmation before
-deploying, database backup and restore verification, and a handover document
-(`docs/handover.md`). It is not covered here, and this document should not be read
-as describing production behaviour: the staging workflow deploys automatically on
-merge, hosts a single stack, has no backup/restore step and no TLS. Anything
-production-specific — the confirmation gate, backups, the domain, HTTPS — belongs
-to that slice.
+Production deployment machinery exists in the repository as of the PR that added
+this section (`docker/docker-compose.prod.yml`, `.env.production.example`,
+`docker/backup.sh`, `docker/restore.sh`,
+`.github/scripts/prod-deploy-lib.sh`,
+`.github/workflows/deploy-production.yml`). **No production deployment has been
+executed**: there is no `production` GitHub Environment yet, no production
+secrets are configured, and nothing named `roomflow-prod-*` exists on any host.
+Everything below is the plan and its pre-verified mechanics; the first real
+deploy additionally requires the environment setup in §11.2 and the operator's
+final confirmation.
+
+### 11.1 Architecture and isolation
+
+`docker/docker-compose.prod.yml` mirrors the staging compose with every
+identifier and default changed to a production value:
+
+| Property | dev | staging | **production** |
+| --- | --- | --- | --- |
+| Compose project | `roomflow-dev` | `roomflow-staging` | `roomflow-prod` |
+| Spring profile | `dev` | `staging` | `prod` (hardcoded, not a variable) |
+| Containers | `roomflow-dev-*` | `roomflow-staging-*` | `roomflow-prod-*` |
+| Volumes | `roomflow-dev_*-data` | `roomflow-staging_staging-*-data` | `roomflow-prod_prod-mysql-data`, `roomflow-prod_prod-redis-data` |
+| Network | `roomflow-dev_default` | `roomflow-staging_staging-net` | `roomflow-prod_prod-net` |
+| Frontend port | `80` | `8081` | `8082` (operator sets `PROD_FRONTEND_PORT`, e.g. `80` on a dedicated host) |
+| Backend (loopback) | `8080` | `18080` | `28080` |
+| MySQL (loopback) | `13306` | `13307` | `23306` |
+| Redis (loopback) | `16379` | `16380` | `26379` |
+| RabbitMQ AMQP / mgmt (loopback) | `15672`/`15673` | `15674`/`15675` | `25672`/`25673` |
+| Deploy dir | (local) | `/opt/roomflow/staging` | `/opt/roomflow/production` (variable `PROD_DEPLOY_DIR`) |
+| Env file | `.env` | `.env.staging` | `.env.production` |
+
+All production middleware binds to `127.0.0.1`; only the frontend is published.
+`SPRING_PROFILES_ACTIVE=prod` is hardcoded in the compose file so no pipeline
+variable can boot the production box with the wrong profile. All stack-level
+invariants (immutable `${IMAGE_TAG:?}` pin, `${VAR:?}` required-value guards,
+no `env_file:` directive, loopback-only middleware, single-quote-`$` rule) are
+identical to staging — the compose header spells them out.
+
+The host-side rules (newline-safe allowlists, env-file resolution, probe-URL
+derivation, the `${VAR:?}` pre-flight scan) live in
+`.github/scripts/staging-deploy-lib.sh` unchanged.
+`.github/scripts/prod-deploy-lib.sh` is a thin overlay that sources it and
+overrides only the four environment-specific functions (`resolve_env_file`,
+`env_file_help`, `resolve_probe_url`, `prod_context`), so a fix to a shared
+rule lands on both stacks and the two libraries cannot drift apart.
+
+### 11.2 The `production` GitHub Environment (required; does not exist yet)
+
+Only the `staging` environment exists today. Before the first production
+deploy, create `production` in **Settings → Environments**:
+
+* **Required reviewers** — at least one human approver. This approval *is* the
+  final human confirmation the project convention requires; the workflow has
+  no other trigger (see §11.4).
+* **Deployment branches** — restrict to `main`.
+* **Secrets (environment scope, never repository scope):**
+
+| Secret | Content |
+| --- | --- |
+| `PROD_SSH_PRIVATE_KEY` | private key of the deploy user on the production host — **a different key than staging's** |
+| `PROD_HOST` | production host name or IP |
+| `PROD_USER` | SSH user able to run `docker` and own the deploy dir |
+| `PROD_KNOWN_HOSTS` | recommended: full `ssh-keyscan -p <port> -t ed25519,ecdsa,rsa <host>` output, verified out of band once |
+| `GHCR_READ_TOKEN` | optional; only if the GHCR packages are made private |
+
+* **Variables (non-secret):**
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PROD_DEPLOY_DIR` | `/opt/roomflow/production` | deploy directory on the host |
+| `PROD_SSH_PORT` | `22` | SSH port (set `2222` if the prod host shares the staging host's sshd) |
+| `PROD_ENV_FILE` | unset → auto-detect `.env.production` then `.env` | env-file name inside the deploy dir |
+| `PROD_BACKEND_URL` / `PROD_FRONTEND_URL` | unset → derived from env-file ports | probe-URL overrides |
+| `GHCR_USER` | `github.actor` | only with `GHCR_READ_TOKEN` |
+
+### 11.3 Host prerequisites and `.env.production`
+
+On the production host: `deploy`-equivalent user with `docker` access, deploy
+dir owned by it, and `.env.production` created **on the host** from
+`.env.production.example` with every `CHANGE_ME` filled. The file is
+operator-owned — the workflow never creates or overwrites it, and fails fast
+if it is missing or has an empty required value (the required set is read from
+the compose file's own `${VAR:?}` guards).
+
+**Values that must differ from staging**: `JWT_SECRET`, `DB_PASSWORD`,
+`MYSQL_ROOT_PASSWORD`, `REDIS_PASSWORD`, `RABBITMQ_PASSWORD`, and the admin
+password behind `ADMIN_PASSWORD_HASH`. A leaked staging credential must never
+be usable against production. `ADMIN_PASSWORD_HASH` is generated **offline**
+(same tooling as §4.5) and written **single-quoted** — the interpolation hazard
+was re-confirmed during verification: an unquoted BCrypt value in an env file
+is re-interpolated by Compose into an empty string (observed warning:
+`variable "N9qo8uLOickgx2ZMRZoMye..." is not set`).
+
+Backup settings read by `docker/backup.sh` (host-side, not by Compose):
+`BACKUP_DIR` (default `/opt/roomflow/backups/production`, created `0700`) and
+`BACKUP_KEEP` (default `10`).
+
+### 11.4 Deploy flow — manual-only by design
+
+`deploy-production.yml` has **exactly one trigger: `workflow_dispatch`**. There
+is no `push:`/`workflow_run:` path — production never deploys automatically on
+merge (that property belongs to staging only). A run requires a full
+40-character commit SHA input, then pauses at the `production` environment's
+required-reviewers gate. Only after a human approves does the job get the
+environment's secrets and proceed:
+
+1. Validate tag (full SHA) and all values that reach remote command lines.
+2. Configure SSH (pinned host key when `PROD_KNOWN_HOSTS` is set).
+3. Capture the currently deployed image tag → rollback target.
+4. Ship `docker-compose.prod.yml`, `health-check.sh`, `backup.sh`,
+   `restore.sh` and both deploy libraries from the deployed revision.
+5. **Pre-deploy database backup** (`backup.sh` on the host). Exit 0 = dump
+   written and gzip-verified; exit 3 = no running database (first deploy), OK;
+   anything else **refuses the deploy** — deploying over a live database
+   without a restore point is exactly the risk this step removes. The backup
+   path is printed in the step log (contains no secrets) and named in the run
+   summary.
+6. `docker compose up -d` with `IMAGE_TAG=<sha>`.
+7. On-host health check (backend `/actuator/health` + frontend, ports derived
+   from the env file). Exit 2 = host configuration error → **no rollback**
+   (same contract as staging).
+8. On deploy/health failure: **automatic image-level rollback** to the
+   previous tag + re-verification. The database is deliberately **not**
+   restored — Flyway is forward-only and whether a bad release needs a data
+   restore is an operator decision (§11.5).
+
+Concurrency `deploy-production` with `cancel-in-progress: false`; per-step
+timeouts with a 60-minute job backstop.
+
+### 11.5 Backup, restore and rollback procedures
+
+**Backup** (`docker/backup.sh`, on the host):
+
+```bash
+bash /opt/roomflow/production/backup.sh /opt/roomflow/production
+```
+
+Dumps the database with `mysqldump` **inside** the mysql container (the host
+needs no MySQL client — verified: none is installed), gzip's it to
+`$BACKUP_DIR/roomflow-prod-<UTC timestamp>.sql.gz` (mode `600`, dir `700`),
+verifies the gzip, and prunes to the newest `BACKUP_KEEP` dumps. The root
+password expands **inside the container** from its own environment — it is
+never an argument on any host or ssh command line.
+
+**Restore** (`docker/restore.sh`) is deliberately two-step destructive:
+
+```bash
+bash /opt/roomflow/production/restore.sh /opt/roomflow/production \
+  /opt/roomflow/backups/production/roomflow-prod-<ts>.sql.gz roomflow
+```
+
+The third argument must repeat the target database name — proof the restore is
+deliberate and aimed at the right DB. For a real restore it first takes a
+pre-restore safety dump, stops the backend container, replays the dump, and
+restarts the backend. (`TARGET_DB` + `SKIP_BACKEND_STOP=yes` env overrides
+exist for scratch-schema verification only.)
+
+**Rollback** is automatic and image-level only (see §11.4 step 8). Manual
+image rollback: dispatch the workflow with the older known-good SHA. Data
+rollback: the restore procedure above with the pre-deploy dump.
+
+### 11.6 Verification record (2026-09-17, pre-deployment)
+
+All mechanics were exercised on the real host over SSH **without creating any
+production resource** — the prod stack itself was never started:
+
+| Check | Result |
+| --- | --- |
+| `bash -n` on `backup.sh`, `restore.sh`, `prod-deploy-lib.sh` | pass |
+| `docker compose config` on `docker-compose.prod.yml` | valid |
+| Resolved volume names | `prod-mysql-data`, `prod-redis-data` → `roomflow-prod_*` |
+| Resolved network name | `prod-net` → `roomflow-prod_prod-net` |
+| Host inventory | no `roomflow-prod-*` volume/network/container exists; dev and staging sets unchanged |
+| `backup.sh` live run (targeted at the staging MySQL container via `MYSQL_CONTAINER` override, scratch backup dir) | real gzip dump written, verified |
+| Dump content | 6 `CREATE TABLE` + data for `account, flyway_schema_history, meeting, notification, participant, room` — matches live schema |
+| `restore.sh` into scratch schema `roomflow_verify_scratch` | row counts identical for all 6 tables |
+| Scratch cleanup | schema dropped; scratch dirs removed; staging data untouched |
+| Refusal paths | wrong confirm name → rc 1; missing file → rc 1; `..` path → rc 1; no container → rc 3; no env file → rc 1 with actionable message |
+| `$`-interpolation hazard | re-confirmed live: unquoted BCrypt value interpolates to blank |
+| Rollback mechanism | image-level path is the same proven staging code path (library + `compose up` + health re-verify); staging's real auto-rollback was exercised in run `35114626866` |
+
+### 11.7 What remains before the first production deploy
+
+1. Create the `production` GitHub Environment per §11.2 (reviewers, branch
+   restriction `main`, environment-scoped secrets/variables).
+2. Provision the production host (or the prod slice of a shared host): deploy
+   user + SSH key, deploy dir, `.env.production` with production-only values,
+   backup dir.
+3. Human dispatch of `Deploy Production` with the chosen SHA → environment
+   approval → the run itself performs backup → deploy → health check →
+   rollback-if-needed.
+
+**Until then: no automatic or agent-initiated production deploy.** TLS, the
+public domain, and any scheduled-backup cron remain operator decisions outside
+this slice.
 
 ---
 
