@@ -1636,3 +1636,108 @@ admin-only flows. Do not read the smoke pass as covering those.
   robust for the same reason as the frontend fix.
 - Dev-suite specs sharing `fillTimeRange` were not re-run against the dev
   stack here.
+
+---
+
+## 13. Staging acceptance — completion record (2026-09-17)
+
+Branch `feat/staging-acceptance`, PR #9, base `main` @ `24f7371`. This slice
+had two workstreams: fix the flaky `MeetingLifecycleIT` at its root cause, and
+expand staging Playwright coverage to the full acceptance list with a real
+`E2E Staging` workflow. What ran, what is blocked, and what is residual.
+
+### The `MeetingLifecycleIT` flake — root cause and fix
+
+- **Root cause** (`sweepEndsExpiredMeetingAndNotifiesActiveParticipants`):
+  the test inserted an *already-overdue* meeting and added participants
+  afterwards. With the 500 ms test sweep the scheduler could end the meeting
+  in the gap between insert and participant rows; end-notifications are
+  generated once, at end time, for the participants present then — so the
+  awaited notification could never arrive. That is the 30 s `awaitTrue`
+  timeout flake, and no timeout increase could fix it.
+- **Fix** (`34f7f96`): insert the meeting with a *future* `end_time`
+  (invisible to `findOverdueActiveMeetingIds`), add every participant, then
+  flip `end_time` to the past in one `UPDATE`. The sweep can only ever
+  observe a fully populated meeting. The second-recipient notification
+  assertions were also changed from single-shot asserts to symmetric awaits,
+  because RabbitMQ delivery is asynchronous.
+- No timeout was raised and no assertion weakened; the ShedLock
+  Redis-key observation is unchanged and now documented in a comment.
+- `d5149db` is a spotless-formatting commit on the same file; `ae6c7c8`
+  widens the default chromium project's `testIgnore` to every
+  `staging-*.spec.ts` so a dev run never collects the staging specs.
+
+### Consecutive green CI runs containing the IT
+
+| Run | Event | Result | `MeetingLifecycleIT` |
+| --- | --- | --- | --- |
+| [35182120358](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35182120358) | push | success | 8/8 pass |
+| [35182123332](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35182123332) | pull_request | success | 8/8 pass |
+| [35182849895](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35182849895) | push | success | 8/8 pass |
+| [35182852633](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35182852633) | pull_request | success | 8/8 pass |
+
+Four consecutive runs, each executing the full Testcontainers suite with the
+fixed test. The two earlier runs on this branch (`35181936082`,
+`35181965458`) failed at `spotless:check` *before* the test phase — the IT
+never ran in them, so they are not counted and do not contradict the streak.
+
+### Staging E2E acceptance suite — written, not yet executed
+
+`.github/workflows/e2e-staging.yml` plus
+`frontend/tests/e2e/staging-acceptance.spec.ts` cover all twelve acceptance
+items (matrix below). **The suite has NOT been executed against staging**:
+the `staging` environment is missing `STAGING_ADMIN_PASSWORD` and
+`STAGING_E2E_PASSWORD`. Verified on 2026-09-17 via
+`gh api repos/niuyeyeplus/RoomFlow/environments/staging/secrets` — only the
+four SSH secrets exist (`STAGING_HOST`, `STAGING_USER`,
+`STAGING_SSH_PRIVATE_KEY`, `STAGING_KNOWN_HOSTS`); repository-level secrets
+are empty. Per the no-bypass rule, no run was attempted with invented, dev,
+or otherwise substituted credentials, and the workflow's own fail-fast step
+plus the `pretest:e2e:staging` hook would refuse to start without them anyway.
+
+To execute once the secrets exist:
+
+```bash
+gh secret set STAGING_ADMIN_PASSWORD --env staging          # seeded admin's password, via stdin
+gh secret set STAGING_E2E_PASSWORD   --env staging          # password for spec-registered accounts
+gh workflow run e2e-staging.yml --ref main                  # or --ref feat/staging-acceptance pre-merge
+```
+
+The workflow runs on `workflow_dispatch` and, after merge, on every
+successful `Deploy Staging` on `main` (`workflow_run`; the trigger file must
+live on the default branch, so the chain activates only post-merge).
+
+### Coverage matrix — spec → acceptance items
+
+| # | Acceptance item | Where covered |
+| --- | --- | --- |
+| 1 | Admin login | `admin room management` — `uiLogin` as `admin`, `.nav-menu` shows the admin entry |
+| 2 | Room create/edit/disable/enable/delete | `admin room management` — every step via UI, each verified via API (incl. 40906 booking rejection while disabled) |
+| 3 | Create meeting | `meeting lifecycle` — UI create, 201 response + detail page asserted |
+| 4 | Update a not-yet-started meeting | `meeting lifecycle` — UI edit, PUT 200, API re-read confirms title |
+| 5 | Cancel meeting | `meeting lifecycle` — UI cancel with confirm dialog, 已取消 tag |
+| 6 | Logical-delete meeting | `meeting lifecycle` — UI delete, GET returns 404/40401 afterwards |
+| 7 | End meeting early | `real-time lifecycle` — waits for the real start boundary, UI 提前结束, `ENDED` + `endedEarly=true` |
+| 8 | Auto-end on expiry | `real-time lifecycle` — 15-min meeting on the real 60 s staging sweep, polled until `ENDED`, `endedEarly=false` |
+| 9 | Slot release after cancel/delete/end | inline in both tests — the freed interval is rebooked via API and must return 201 |
+| 10 | Signup/withdraw/kick/permanent ban | `participant flows` — UI join, UI leave, API rejoin allowed, UI kick, rejoin then rejected 40904 |
+| 11 | Notification creation + mark-read | `participant flows` (JOINED/LEFT/KICKED via MQ, UI mark-read) + `real-time lifecycle` (MEETING_ENDED for organizer and participant) |
+| 12 | Permission boundaries | `normal user is rejected` (no admin nav, route-guard bounce, 403 on all four admin room endpoints) + `participant flows` (outsider 403 on edit/cancel/end/kick/delete, no manage buttons in UI, admin deleting another user's meeting) |
+
+### Residual staging data and known limits
+
+- Registered `stg_*` accounts remain on the shared staging database on every
+  run — there is no delete-user API. They are identifiable by their
+  `uniqName` prefixes (`stg_perm`, `stg_lc`, `stg_porg`, `stg_rt`, ...).
+- Meetings and rooms are deleted/cancelled/disabled via API on the happy
+  path. A mid-test failure can leave a meeting `ACTIVE` until the real sweep
+  ends it, and — in `real-time lifecycle` only — a created scratch room
+  enabled; both carry `STG-` names for identification.
+- Failure artifacts are `frontend/test-results` only (junit/html + failure
+  screenshots). Trace and video are OFF for the staging project so no typed
+  credential can persist in an uploaded artifact; screenshots of password
+  fields render masked.
+- The secrets fail-fast step deliberately omits `STAGING_KNOWN_HOSTS`:
+  without it the job falls back to `StrictHostKeyChecking=accept-new` with a
+  warning, mirroring `deploy-staging.yml`. The secret *is* set today, so
+  strict pinning applies.
