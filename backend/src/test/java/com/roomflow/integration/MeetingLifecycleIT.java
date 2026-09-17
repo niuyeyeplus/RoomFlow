@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.roomflow.common.enums.MeetingStatus;
 import com.roomflow.common.enums.NotificationType;
 import com.roomflow.common.enums.Role;
@@ -185,14 +186,27 @@ class MeetingLifecycleIT extends AbstractContainersIT {
     Account user = newUser("it_sweep_user");
     LocalDateTime now = LocalDateTime.now(ZONE);
     Long roomId = newRoom();
-    // Already past its end_time: the next sweep must end it.
-    Meeting m = insertMeeting(roomId, admin.id(), now.minusHours(2), now.minusMinutes(30));
+    // Populate the meeting BEFORE it can become a sweep candidate; the flip
+    // below is what makes it overdue. Inserting an
+    // already-overdue meeting and adding participants afterwards let the 500ms sweep
+    // fire in between: it ended a meeting whose participant list was still empty, the
+    // end-notifications were generated once at end time, and the awaited notification
+    // never arrived (the 30s awaitTrue timeout flake). Insert with a FUTURE end_time
+    // (invisible to findOverdueActiveMeetingIds), add every participant, then flip
+    // end_time to the past with one UPDATE - the next sweep ends a fully-populated
+    // meeting and can never observe a partially-populated one.
+    Meeting m = insertMeeting(roomId, admin.id(), now.minusHours(2), now.plusHours(1));
     addParticipant(m.getId(), admin.id(), true);
     addParticipant(m.getId(), user.getId(), false);
     Participant left = addParticipant(m.getId(), newUser("it_sweep_left").getId(), false);
     left.setLeftAt(now.minusMinutes(10));
     left.setLeaveReason(com.roomflow.common.enums.LeaveReason.USER_LEFT);
     participantMapper.updateById(left);
+    meetingMapper.update(
+        null,
+        new LambdaUpdateWrapper<Meeting>()
+            .eq(Meeting::getId, m.getId())
+            .set(Meeting::getEndTime, now.minusMinutes(30).truncatedTo(ChronoUnit.SECONDS)));
 
     awaitTrue(
         () -> reload(m.getId()).getStatus() == MeetingStatus.ENDED,
@@ -205,10 +219,17 @@ class MeetingLifecycleIT extends AbstractContainersIT {
 
     // Real RabbitMQ + consumer chain: one MEETING_ENDED per ACTIVE participant, none for the
     // user who left.
+    // One MEETING_ENDED message per active participant is published after commit and
+    // consumed asynchronously; a single-shot assert on the second recipient can run
+    // before its message is consumed. Await each awaited recipient symmetrically.
     awaitTrue(
         () -> endNotificationsFor(m.getId(), user.getId()) == 1,
         "end notification for active participant");
-    assertEquals(1, endNotificationsFor(m.getId(), admin.id()));
+    awaitTrue(
+        () -> endNotificationsFor(m.getId(), admin.id()) == 1,
+        "end notification for organizer");
+    // The user who left is never a publish target at all, and both real messages are
+    // already consumed, so zero is a stable assertion here.
     assertEquals(0, endNotificationsFor(m.getId(), left.getAccountId()));
 
     // Idempotency: further sweeps must not re-notify.
@@ -218,6 +239,12 @@ class MeetingLifecycleIT extends AbstractContainersIT {
 
   @Test
   void shedlockKeyIsHeldInRedisDuringSweep() throws InterruptedException {
+    // Why polling for the key is a stable observation: RedisLockProvider does not
+    // delete the lock row on release - it keeps it until lockAtLeast (PT2S here), and
+    // with a 500ms fixedDelay the next acquisition lands well inside that window, so
+    // the record is present essentially continuously once the first sweep has run.
+    // The only gap is before the first acquisition at context start, which the 30s
+    // await covers.
     awaitTrue(
         () -> {
           Set<String> keys = redis.keys("*meeting-end-sweep*");
@@ -259,7 +286,10 @@ class MeetingLifecycleIT extends AbstractContainersIT {
     awaitTrue(
         () -> endNotificationsFor(m.getId(), user.getId()) == 1,
         "end-early notification for participant");
-    assertEquals(1, endNotificationsFor(m.getId(), admin.id()));
+    // Same per-participant async delivery as above: await, don't single-shot assert.
+    awaitTrue(
+        () -> endNotificationsFor(m.getId(), admin.id()) == 1,
+        "end-early notification for organizer");
   }
 
   @Test
