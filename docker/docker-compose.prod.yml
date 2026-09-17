@@ -1,0 +1,202 @@
+# RoomFlow PRODUCTION container stack.
+#
+# Mirrors docker/docker-compose.staging.yml with every name, volume, network
+# and default port changed to the prod set, and SPRING_PROFILES_ACTIVE pinned
+# to `prod` (backend/src/main/resources/application-prod.yml). The stack is
+# INDEPENDENT of both the dev stack (docker/docker-compose.yml) and the
+# staging stack: no shared network, volume, container name or host port, so
+# all three can coexist on one host. On a dedicated production host the
+# isolation is identical; nothing below assumes co-location.
+#
+# Usage — always run from the DEPLOY DIRECTORY (the compose project dir):
+#   cp .env.production.example .env.production   # then fill every CHANGE_ME
+#   IMAGE_TAG=<40-char git sha> \
+#   docker compose --project-directory . --env-file .env.production \
+#     -f docker-compose.prod.yml up -d
+#
+# `.env.production` MUST exist before the command above: it is gitignored and
+# operator-owned — the deploy workflow never creates or overwrites it.
+#
+# SINGLE-QUOTE ANY VALUE CONTAINING '$' in .env.production — the exact same
+# Compose double-interpolation rule documented at length in
+# docker-compose.staging.yml and .env.production.example applies unchanged:
+# an unquoted or double-quoted '$' is re-expanded, which silently empties
+# DB_PASSWORD, REDIS_PASSWORD, JWT_SECRET and — the canonical casualty —
+# ADMIN_PASSWORD_HASH (a BCrypt hash is ALL dollar signs).
+#
+# SPRING_PROFILES_ACTIVE is hardcoded to `prod` (not a variable) on purpose —
+# the same reasoning as the staging file: a hardcoded profile removes the
+# failure mode where a pipeline exports SPRING_PROFILES_ACTIVE=dev/staging and
+# boots the production box with the wrong profile.
+
+name: roomflow-prod
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: roomflow-prod-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-roomflow}
+      MYSQL_USER: ${DB_USERNAME:-roomflow}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?must be set in .env.production}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?must be set in .env.production}
+    # Bound to loopback only: production middleware is reachable exclusively
+    # via an SSH tunnel, never from the public interface.
+    ports:
+      - "127.0.0.1:${PROD_DB_PORT:-23306}:3306"
+    volumes:
+      # Production-only named volume. Never point this at the staging or dev
+      # volumes: separate lifecycles, separate data, separate backups.
+      - prod-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root --password=$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - prod-net
+
+  redis:
+    image: redis:8.2-alpine
+    container_name: roomflow-prod-redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?must be set in .env.production}
+    # Same guard as staging: refuse to start if the password that actually
+    # arrived is empty (a '$'-mangled value would otherwise come up with NO
+    # authentication on prod-net).
+    command:
+      - sh
+      - -c
+      - >-
+        test -n "$$REDIS_PASSWORD" || { echo "roomflow-prod: REDIS_PASSWORD is empty after
+        Compose interpolation - single-quote the value in .env.production, see the header of
+        docker-compose.prod.yml" >&2; exit 1; };
+        exec redis-server --requirepass "$$REDIS_PASSWORD"
+    ports:
+      - "127.0.0.1:${PROD_REDIS_PORT:-26379}:6379"
+    volumes:
+      - prod-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - prod-net
+
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    container_name: roomflow-prod-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:?must be set in .env.production}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?must be set in .env.production}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-roomflow}
+    # Loopback-only: AMQP and the management UI are operator-facing ports;
+    # reach them through an SSH tunnel.
+    ports:
+      - "127.0.0.1:${PROD_RABBITMQ_PORT:-25672}:5672"
+      - "127.0.0.1:${PROD_RABBITMQ_MGMT_PORT:-25673}:15672"
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - prod-net
+
+  backend:
+    # Same immutable-pin rule as staging: ${IMAGE_TAG:?} is fail-fast — no
+    # silent fallback to a mutable tag. The deploy workflow passes the 40-char
+    # git sha.
+    image: ghcr.io/niuyeyeplus/roomflow-backend:${IMAGE_TAG:?must be set to an immutable tag, e.g. the git sha}
+    container_name: roomflow-prod-backend
+    restart: unless-stopped
+    environment:
+      # Hardcoded, not interpolated — see the header comment.
+      SPRING_PROFILES_ACTIVE: prod
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-roomflow}
+      DB_USERNAME: ${DB_USERNAME:-roomflow}
+      DB_PASSWORD: ${DB_PASSWORD:?must be set in .env.production}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?must be set in .env.production}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:?must be set in .env.production}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?must be set in .env.production}
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST:-roomflow}
+      # application-prod.yml resolves the JWT key as
+      # ${ROOMFLOW_JWT_SECRET:${JWT_SECRET}}; pass JWT_SECRET only so a single
+      # variable drives it (same convention as staging).
+      JWT_SECRET: ${JWT_SECRET:?must be set in .env.production}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-30d}
+      # STARTUP-CRITICAL — identical contract to staging: application-prod.yml
+      # declares the Flyway placeholder `admin-password-hash:
+      # ${ADMIN_PASSWORD_HASH}` with NO default, so a missing value fails the
+      # backend during startup (before /actuator/health). The value is a BCrypt
+      # hash produced OFFLINE — write it SINGLE-QUOTED in .env.production.
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?must be a BCrypt hash generated offline - production backend fails at startup without it}
+      # Guarded so every production deploy states its origins explicitly; an
+      # empty value means no cross-origin requests (browsers reject the SPA).
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?must list the production SPA origin(s), comma-separated}
+    # Backend is exposed on loopback as well (deploy-time health checks and
+    # SSH tunnels). nginx reaches it over the internal prod-net network.
+    ports:
+      - "127.0.0.1:${PROD_BACKEND_PORT:-28080}:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks:
+      - prod-net
+
+  frontend:
+    # Same immutable-pin rule as the backend above.
+    image: ghcr.io/niuyeyeplus/roomflow-frontend:${IMAGE_TAG:?must be set to an immutable tag, e.g. the git sha}
+    container_name: roomflow-prod-frontend
+    restart: unless-stopped
+    # The frontend is the public entry point. The default (8082) deliberately
+    # avoids the dev stack's port 80 and the staging stack's 8081 on a shared
+    # host; on a dedicated host set PROD_FRONTEND_PORT=80 (or put the TLS
+    # proxy in front of it) in .env.production.
+    ports:
+      - "${PROD_FRONTEND_PORT:-8082}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - prod-net
+
+volumes:
+  # Explicitly prod-prefixed: must never resolve to the staging or dev
+  # volumes. Fully-qualified names are roomflow-prod_prod-mysql-data and
+  # roomflow-prod_prod-redis-data.
+  prod-mysql-data:
+  prod-redis-data:
+
+networks:
+  # Project-scoped (roomflow-prod_prod-net); unreachable from the dev and
+  # staging projects.
+  prod-net:
+    driver: bridge

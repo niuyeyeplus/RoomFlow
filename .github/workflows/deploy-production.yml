@@ -1,0 +1,933 @@
+# Production deployment.
+#
+# Deploys, to the production host, an explicitly chosen immutable image tag,
+# takes a database backup BEFORE touching the stack, runs a post-deploy health
+# check ON THE HOST, and automatically rolls the application back to the
+# previously deployed tag if that health check fails. The database backup is
+# deliberately NOT restored by the rollback: a failed application release is
+# fixed by re-pointing the images, while restoring data is an operator's call
+# (docker/restore.sh — see docs/deployment.md).
+#
+# ---------------------------------------------------------------------
+# THIS WORKFLOW IS MANUAL-ONLY — by design and by project convention.
+# ---------------------------------------------------------------------
+# There is NO `push:` and NO `workflow_run:` trigger. Production is only ever
+# deployed by a human running this workflow (`workflow_dispatch`), and the run
+# then stops at the `production` GitHub Environment's required-reviewers gate
+# for an explicit human approval before the job is allowed to touch the host.
+# Automatic deployment on merge is reserved for staging.
+#
+# ---------------------------------------------------------------------
+# REQUIRED USER ACTION: create the "production" GitHub Environment
+# ---------------------------------------------------------------------
+# The job declares `environment: production`, which does not exist yet, and
+# GitHub auto-creates a referenced environment with NO rules — so until you
+# configure it, the gate protects nothing. In Settings > Environments, create
+# "production":
+#   * Required reviewers  - a human approves EVERY production deploy. This is
+#                           the final confirmation the project convention
+#                           requires before a production release.
+#   * Deployment branches - restrict to `main` only.
+#   * Create these secrets at ENVIRONMENT scope (never repository scope):
+#       PROD_SSH_PRIVATE_KEY, PROD_HOST, PROD_USER, PROD_KNOWN_HOSTS
+#   * Optionally create the environment variables listed below.
+# WHY: repository-scoped secrets reach a workflow run on ANY branch, so
+# without the gate a collaborator with push access to any branch could edit
+# this workflow there, dispatch it, and print the deploy key. The gate only
+# closes that hole once the secrets are environment-scoped AND the branch
+# policy is set. Do NOT reuse the staging secrets: a leaked staging deploy key
+# must never reach production, and production must not depend on the staging
+# environment's configuration.
+#
+# HOW VALUES REACH THE HOST, the newline-safe allowlist model, and why the
+# health check runs on the host are IDENTICAL to deploy-staging.yml — read its
+# header first. Every value that reaches a remote command line matches a
+# strict allowlist re-applied on both sides:
+#   deploy dir  ^/[A-Za-z0-9._/-]+$    image tag  ^[0-9a-f]{40}$ (full SHA)
+#   env file    bare name [A-Za-z0-9._-], no '/' and no '..'
+#   probe URL   ^https?://[A-Za-z0-9._:/-]+$
+#   ssh port    digits only, no leading zero, 1-65535
+# The shared rules live in .github/scripts/staging-deploy-lib.sh; the
+# production-specific ones in .github/scripts/prod-deploy-lib.sh.
+#
+# SECRETS (Settings > Secrets and variables > Actions > production env):
+#   PROD_SSH_PRIVATE_KEY   private key of the deploy user on the production
+#                          host. Use a DIFFERENT key than staging.
+#   PROD_HOST              production host name or IP.
+#   PROD_USER              SSH user; must run `docker` and own the deploy dir.
+#   PROD_KNOWN_HOSTS       OPTIONAL but recommended: the host's known_hosts
+#                          line (pin it — production is the high-value target).
+#   GHCR_READ_TOKEN        OPTIONAL — the roomflow-* packages are public; set
+#                          only if they are made private (see deploy-staging).
+#
+# VARIABLES (same screen, "Variables" tab - non-secret):
+#   PROD_DEPLOY_DIR   deploy dir on the host (default /opt/roomflow/production).
+#   PROD_SSH_PORT     SSH port (default 22). Same validation as staging.
+#   PROD_ENV_FILE     env-file NAME inside the deploy dir. Unset = auto-detect
+#                     `.env.production` first (the documented name), then
+#                     `.env`. Never silently falls back when set.
+#   PROD_BACKEND_URL / PROD_FRONTEND_URL
+#                     OPTIONAL probe-URL overrides; unset = derived on the
+#                     host from PROD_BACKEND_PORT / PROD_FRONTEND_PORT in the
+#                     env file (defaults 28080 / 8082).
+#   GHCR_USER         OPTIONAL GHCR username for the conditional login.
+#
+# HOST PREREQUISITES (not created by this workflow):
+#   * `.env.production` (or the file named by PROD_ENV_FILE) in the deploy
+#     dir — built from .env.production.example with every CHANGE_ME filled.
+#     The required set is read from the compose file's own ${VAR:?} guards.
+#   * curl, docker with the compose v2 plugin, and sshd.
+#   * Network access from the host to ghcr.io.
+#
+# ROLLBACK SEMANTICS — image vs. data:
+#   * The automatic rollback re-points `docker compose up` at the previous
+#     image tag and re-verifies health. It does NOT touch the database.
+#   * A schema migration shipped in a bad release is NOT automatically undone
+#     (Flyway is forward-only). If the release corrupted the schema, the
+#     operator restores the pre-deploy dump with docker/restore.sh — the run
+#     summary names the exact backup file.
+#   * Flyway refuses a database at a NEWER version than the app knows, so a
+#     rollback across a migration boundary may need that restore first; the
+#     workflow deliberately does not decide this itself.
+
+name: Deploy Production
+
+on:
+  # THE ONLY trigger. The human picks the tag, then the `production`
+  # environment's required reviewers give the final confirmation. There is
+  # deliberately no workflow_run/push path — see the header.
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: >-
+          REQUIRED: the full 40-character commit SHA to deploy (the tag CI
+          built). To roll back manually, pass an older known-good SHA.
+        required: true
+        type: string
+
+# Minimal: this workflow only reads the repository. GHCR access happens on the
+# production host and uses no GitHub credential by default - least privilege.
+permissions:
+  contents: read
+
+# Serialise production deploys and never cancel one midway: cancelling between
+# `compose up` and the health check would leave the host in an unknown state.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy-production:
+    runs-on: ubuntu-latest
+    # Gate the whole job behind the environment so the deploy key is only
+    # reachable by an approved run on an allowed branch. See the header.
+    environment: production
+    # Backstop only. EVERY step below also carries its own timeout, so the
+    # worst case is bounded and known:
+    #   setup (resolve 2 + checkout 2 + verify 2 + validate 2 + ssh 2 +
+    #   previous-tag 2 + ship 3) = 15, pre-deploy backup 5, ghcr login 2,
+    #   deploy 10, health 8, rollback 10, diagnostics 5, report 2 = 57 total.
+    timeout-minutes: 60
+    env:
+      PROD_DEPLOY_DIR: ${{ vars.PROD_DEPLOY_DIR || '/opt/roomflow/production' }}
+      # Empty = auto-detect on the host: .env.production first, then .env.
+      PROD_ENV_FILE: ${{ vars.PROD_ENV_FILE || '' }}
+      # Empty = derive the probe URLs on the host from the env file's
+      # PROD_BACKEND_PORT / PROD_FRONTEND_PORT (falling back to 28080 / 8082).
+      PROD_BACKEND_URL: ${{ vars.PROD_BACKEND_URL || '' }}
+      PROD_FRONTEND_URL: ${{ vars.PROD_FRONTEND_URL || '' }}
+    steps:
+      # ---------------------------------------------------------------------
+      # 1. Resolve the image tag. workflow_dispatch-only, so the source is the
+      #    required input — there is no workflow_run ambiguity to resolve, and
+      #    no "default to github.sha" shortcut: the operator must name the
+      #    exact immutable SHA they are releasing.
+      # ---------------------------------------------------------------------
+      - name: Resolve and validate the image tag
+        id: resolve-tag
+        timeout-minutes: 2
+        env:
+          DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          RAW_TAG="${DISPATCH_IMAGE_TAG}"
+          SOURCE="workflow_dispatch input image_tag"
+
+          # GATE 1 - command-injection guard: the tag reaches the remote command
+          # line as an argument to `bash -s`. `case`, not `grep` — see the
+          # staging header for why a grep allowlist accepts newlines.
+          case "${RAW_TAG}" in
+            '' | *[!0-9a-f]*)
+              echo "::error::Invalid image_tag (length ${#RAW_TAG}). It must match ^[0-9a-f]{7,40}$ - a hex commit SHA. Refusing to build a shell command from it."
+              exit 1
+              ;;
+          esac
+          if [ "${#RAW_TAG}" -lt 7 ] || [ "${#RAW_TAG}" -gt 40 ]; then
+            echo "::error::Invalid image_tag (length ${#RAW_TAG}). It must match ^[0-9a-f]{7,40}$ - a hex commit SHA. Refusing to build a shell command from it."
+            exit 1
+          fi
+
+          # GATE 2 - immutability. CI publishes the FULL 40-char SHA, and the
+          # full SHA is what makes the deploy immutable and fetchable. A short
+          # prefix cannot be checked out or pulled, so reject it here.
+          if [ "${#RAW_TAG}" -ne 40 ]; then
+            echo "::error::image_tag must be the full 40-character commit SHA (got ${#RAW_TAG} characters). We never shorten the tag: the full SHA is what makes the deploy immutable."
+            exit 1
+          fi
+
+          # SAFE: proven exactly 40 lowercase hex characters, so it cannot
+          # contain a newline or append a second output key.
+          echo "tag=${RAW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "source=${SOURCE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image tag: ${RAW_TAG} (${SOURCE})"
+
+      # ---------------------------------------------------------------------
+      # 2. Check out the revision being deployed, so the compose file, the
+      #    scripts and the shared libraries shipped to the host always match
+      #    the images.
+      # ---------------------------------------------------------------------
+      - uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          ref: ${{ steps.resolve-tag.outputs.tag }}
+
+      - name: Verify the deploy artifacts exist in this revision
+        timeout-minutes: 2
+        env:
+          IMAGE_TAG: ${{ steps.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in docker/docker-compose.prod.yml docker/health-check.sh docker/backup.sh docker/restore.sh .github/scripts/staging-deploy-lib.sh .github/scripts/prod-deploy-lib.sh; do
+            if [ ! -f "${f}" ]; then
+              echo "::error::Required deploy artifact '${f}' is missing from revision ${IMAGE_TAG}."
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            echo "::error::Cannot deploy: the production compose file, the health-check/backup/restore scripts and both deploy libraries must all exist in the deployed revision."
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------
+      # 3. Validate every value that will reach a remote command line, ONCE,
+      #    before any of them is used.
+      # ---------------------------------------------------------------------
+      - name: Validate deployment configuration
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+
+          # shellcheck source=/dev/null
+          . .github/scripts/staging-deploy-lib.sh
+
+          if ! validate_deploy_dir "${PROD_DEPLOY_DIR}"; then
+            echo "::error::PROD_DEPLOY_DIR must be an absolute path matching ^/[A-Za-z0-9._/-]+$ (length ${#PROD_DEPLOY_DIR}). Refusing to build a shell command from it."
+            exit 1
+          fi
+          if ! validate_env_override "${PROD_ENV_FILE}"; then
+            echo "::error::PROD_ENV_FILE must be a bare file name inside the deploy dir - a name like .env.production, with no '/', no '..' and no shell metacharacters (length ${#PROD_ENV_FILE})."
+            exit 1
+          fi
+          if [ -n "${PROD_BACKEND_URL}" ] && ! validate_probe_url "${PROD_BACKEND_URL}"; then
+            echo "::error::PROD_BACKEND_URL must be a plain http(s) URL matching ^https?://[A-Za-z0-9._:/-]+$ (length ${#PROD_BACKEND_URL})."
+            exit 1
+          fi
+          if [ -n "${PROD_FRONTEND_URL}" ] && ! validate_probe_url "${PROD_FRONTEND_URL}"; then
+            echo "::error::PROD_FRONTEND_URL must be a plain http(s) URL matching ^https?://[A-Za-z0-9._:/-]+$ (length ${#PROD_FRONTEND_URL})."
+            exit 1
+          fi
+
+          echo "Deployment configuration validated: deploy dir, env-file override and probe URLs."
+
+      - name: Configure SSH for the production host
+        timeout-minutes: 2
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+          SSH_PORT: ${{ vars.PROD_SSH_PORT || '22' }}
+        run: |
+          # NOTE: never add `set -x` here - this step handles the deploy key.
+          set -euo pipefail
+
+          if [ -z "${SSH_PRIVATE_KEY}" ]; then
+            echo "::error::Secret PROD_SSH_PRIVATE_KEY is empty; cannot authenticate to the production host."
+            exit 1
+          fi
+          if [ -z "${PROD_HOST}" ] || [ -z "${PROD_USER}" ]; then
+            echo "::error::Secrets PROD_HOST and PROD_USER must both be set."
+            exit 1
+          fi
+
+          # ~/.ssh/config is a CONFIG FILE, not a shell: a newline inside a
+          # value starts a NEW DIRECTIVE (the dangerous one being ProxyCommand,
+          # which fires on every later ssh/scp on the runner - the machine
+          # holding the deploy key). Same checks as the staging step; see
+          # deploy-staging.yml for the full reasoning.
+          case "${SSH_PORT}" in
+            '')
+              echo "::error::PROD_SSH_PORT is set to an empty value. Set it to a TCP port number (1-65535), or unset the variable to use the default 22."
+              exit 1
+              ;;
+            *[!0-9]*)
+              # No value is echoed: this arm is where a newline payload lands.
+              echo "::error::PROD_SSH_PORT must be digits only - a TCP port number (length ${#SSH_PORT}). Refusing to write it into ~/.ssh/config."
+              exit 1
+              ;;
+          esac
+          if [ "${#SSH_PORT}" -gt 5 ]; then
+            echo "::error::PROD_SSH_PORT is ${#SSH_PORT} digits long; a TCP port has at most 5 (1-65535)."
+            exit 1
+          fi
+          case "${SSH_PORT}" in
+            0[0-9]*)
+              echo "::error::PROD_SSH_PORT=${SSH_PORT} has a leading zero. Write it as a plain decimal port (08080 -> 8080)."
+              exit 1
+              ;;
+          esac
+          if [ "${SSH_PORT}" -lt 1 ] || [ "${SSH_PORT}" -gt 65535 ]; then
+            echo "::error::PROD_SSH_PORT=${SSH_PORT} is outside the valid TCP port range 1-65535."
+            exit 1
+          fi
+
+          case "${PROD_HOST}" in
+            *$'\n'* | *$'\r'*)
+              echo "::error::Secret PROD_HOST contains a line break, which would start a new directive in ~/.ssh/config. Re-set the secret to a single-line host name or IP address."
+              exit 1
+              ;;
+            [[:space:]]* | *[[:space:]])
+              echo "::error::Secret PROD_HOST has leading or trailing whitespace (invisible in the GitHub UI). Remove it and re-set the secret."
+              exit 1
+              ;;
+          esac
+          case "${PROD_USER}" in
+            *$'\n'* | *$'\r'*)
+              echo "::error::Secret PROD_USER contains a line break, which would start a new directive in ~/.ssh/config. Re-set the secret to a single-line user name."
+              exit 1
+              ;;
+            [[:space:]]* | *[[:space:]])
+              echo "::error::Secret PROD_USER has leading or trailing whitespace (invisible in the GitHub UI). Remove it and re-set the secret."
+              exit 1
+              ;;
+          esac
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # install -m 600 creates the key already 0600 - never readable by
+          # anyone else, not even for an instant.
+          install -m 600 /dev/stdin ~/.ssh/roomflow_production_deploy <<<"${SSH_PRIVATE_KEY}"
+          unset SSH_PRIVATE_KEY
+
+          # HOST KEY TRUST: with PROD_KNOWN_HOSTS set the key is pinned and a
+          # MITM fails loud; without it we fall back to accept-new (trust on
+          # first use). For PRODUCTION the pinned secret is strongly
+          # recommended - the first connection is the interceptable one.
+          if [ -n "${PROD_KNOWN_HOSTS}" ]; then
+            printf '%s\n' "${PROD_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+            STRICT_HOST_KEY_CHECKING="yes"
+          else
+            : > ~/.ssh/known_hosts
+            STRICT_HOST_KEY_CHECKING="accept-new"
+            echo "::warning::PROD_KNOWN_HOSTS is not set; falling back to StrictHostKeyChecking=accept-new (trust on first use). For production, set the secret to pin the host key."
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          cat > ~/.ssh/config <<EOF
+          Host roomflow-production
+            HostName ${PROD_HOST}
+            User ${PROD_USER}
+            Port ${SSH_PORT}
+            IdentityFile ~/.ssh/roomflow_production_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking ${STRICT_HOST_KEY_CHECKING}
+            UserKnownHostsFile ~/.ssh/known_hosts
+            BatchMode yes
+            ConnectTimeout 15
+            ServerAliveInterval 30
+          EOF
+          chmod 600 ~/.ssh/config
+
+      # ---------------------------------------------------------------------
+      # 4. Rollback target. MUST run before anything on the host is changed.
+      # ---------------------------------------------------------------------
+      - name: Capture the currently deployed tag (rollback target)
+        id: previous-tag
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+
+          # shellcheck source=/dev/null
+          . .github/scripts/staging-deploy-lib.sh
+
+          # First deploy on a fresh host: no container exists, PREV_IMAGE is
+          # empty and we record "no rollback target".
+          PREV_IMAGE="$(ssh roomflow-production "docker inspect --format '{{.Config.Image}}' roomflow-prod-backend 2>/dev/null" || true)"
+
+          # Strip CR/LF before a host-supplied string is echoed into the log.
+          PREV_IMAGE="${PREV_IMAGE//$'\r'/}"
+          PREV_IMAGE="${PREV_IMAGE//$'\n'/}"
+
+          PREV_TAG=""
+          case "${PREV_IMAGE}" in
+            *@sha256:*) ;;
+            *:*) PREV_TAG="${PREV_IMAGE##*:}" ;;
+          esac
+
+          if [ -n "${PREV_TAG}" ] && ! validate_image_tag "${PREV_TAG}"; then
+            echo "::warning::Currently deployed tag '${PREV_TAG}' is not an immutable 40-char commit SHA; automatic rollback will not be attempted for this run."
+            PREV_TAG=""
+          fi
+
+          echo "tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          if [ -n "${PREV_TAG}" ]; then
+            echo "Currently deployed image: ${PREV_IMAGE} -> rollback target ${PREV_TAG}"
+          else
+            echo "No previously deployed image found on the production host (first deploy, or a non-SHA tag was in use). Automatic rollback is unavailable for this run."
+          fi
+
+      # ---------------------------------------------------------------------
+      # 5. Ship the deploy artifacts from the DEPLOYED revision, so the host
+      #    never runs a stale definition. This includes BOTH libraries (the
+      #    production overlay sources its staging sibling at runtime) and the
+      #    backup/restore scripts.
+      # ---------------------------------------------------------------------
+      - name: Ship deploy artifacts to the production host
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+
+          # PROD_DEPLOY_DIR was proven to match ^/[A-Za-z0-9._/-]+$ by the
+          # "Validate deployment configuration" step.
+          ssh roomflow-production mkdir -p "${PROD_DEPLOY_DIR}"
+          scp -q docker/docker-compose.prod.yml "roomflow-production:${PROD_DEPLOY_DIR}/docker-compose.prod.yml"
+          scp -q docker/health-check.sh "roomflow-production:${PROD_DEPLOY_DIR}/health-check.sh"
+          scp -q docker/backup.sh "roomflow-production:${PROD_DEPLOY_DIR}/backup.sh"
+          scp -q docker/restore.sh "roomflow-production:${PROD_DEPLOY_DIR}/restore.sh"
+          scp -q .github/scripts/staging-deploy-lib.sh "roomflow-production:${PROD_DEPLOY_DIR}/staging-deploy-lib.sh"
+          scp -q .github/scripts/prod-deploy-lib.sh "roomflow-production:${PROD_DEPLOY_DIR}/prod-deploy-lib.sh"
+          echo "Shipped docker-compose.prod.yml, health-check.sh, backup.sh, restore.sh and both deploy libraries to ${PROD_DEPLOY_DIR}."
+
+      # ---------------------------------------------------------------------
+      # 6. PRE-DEPLOY DATABASE BACKUP. Runs AFTER the scripts are on the host
+      #    and BEFORE `compose up` touches anything, so a failed release always
+      #    has a restore point from the exact pre-release state.
+      #    backup.sh exit codes:
+      #      0 = backup written and verified (path recorded for the summary)
+      #      3 = no running database (first deploy) - nothing to protect, OK
+      #      1/2 = config error / dump failed - FAIL THE RUN: deploying without
+      #            a backup of a live database is exactly the risk this step
+      #            exists to remove.
+      # ---------------------------------------------------------------------
+      - name: Pre-deploy database backup (on the production host)
+        id: backup
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # Same '' placeholder rule as every other ssh call in this file: an
+          # empty argument vanishes from ssh's space-joined argv and shifts the
+          # remote positionals.
+          set +e
+          ssh roomflow-production bash -s -- "${PROD_DEPLOY_DIR}" "${PROD_ENV_FILE:-''}" <<'REMOTE_BACKUP'
+          set -euo pipefail
+
+          set +e
+          bash "${1-}/backup.sh" "${1-}" "${2-}"
+          RC=$?
+          set -e
+
+          case "${RC}" in
+            0)
+              echo "Pre-deploy backup completed."
+              ;;
+            3)
+              echo "No running production database (first deploy) - pre-deploy backup skipped."
+              ;;
+            *)
+              echo "ERROR: pre-deploy backup failed (backup.sh exit ${RC}). Refusing to deploy without a restore point." >&2
+              exit "${RC}"
+              ;;
+          esac
+          exit 0
+          REMOTE_BACKUP
+          RC=$?
+          set -e
+
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
+          echo "Pre-deploy backup exit code: ${RC}"
+          exit "${RC}"
+
+      # ---------------------------------------------------------------------
+      # 7. Registry auth on the host - ONLY when a credential exists (the
+      #    roomflow-* packages are public; see deploy-staging.yml for the full
+      #    reasoning and the stored-credential caveat).
+      # ---------------------------------------------------------------------
+      - name: Log in to GHCR on the production host (only when GHCR_READ_TOKEN is set)
+        timeout-minutes: 2
+        env:
+          GHCR_USER: ${{ vars.GHCR_USER || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          # NOTE: never add `set -x` here - this step handles a credential.
+          set -euo pipefail
+
+          if [ -z "${GHCR_TOKEN}" ]; then
+            echo "GHCR_READ_TOKEN is not set; skipping 'docker login'. The roomflow-* packages are public, so the host can pull them anonymously and nothing is written to the host's docker config."
+            exit 0
+          fi
+
+          case "${GHCR_USER}" in
+            *"'"* | *$'\n'* | *$'\r'*)
+              echo "::error::GHCR_USER (or the github.actor fallback) contains a single quote or a line break, which cannot be passed safely to the remote 'docker login' command. Set the GHCR_USER repository variable to a plain GHCR username."
+              exit 1
+              ;;
+          esac
+
+          # --password-stdin keeps the token off the remote command line.
+          printf '%s' "${GHCR_TOKEN}" | ssh roomflow-production "docker login ghcr.io --username '${GHCR_USER}' --password-stdin"
+          echo "Logged in to ghcr.io on the production host as ${GHCR_USER} (packages are expected to be private)."
+          echo "::warning::A GHCR credential is now stored on the production host's docker config (base64, not encrypted). Revoke the PAT if the host is decommissioned."
+
+      # ---------------------------------------------------------------------
+      # 8. Deploy.
+      # ---------------------------------------------------------------------
+      - name: Deploy production stack (docker compose up -d)
+        id: deploy
+        timeout-minutes: 10
+        env:
+          IMAGE_TAG: ${{ steps.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # The remote script arrives over stdin (a quoted heredoc) and values
+          # are passed positionally, each already proven on the runner and
+          # re-proven on the host. The '' placeholder keeps a possibly-empty
+          # PROD_ENV_FILE from vanishing out of ssh's space-joined argv and
+          # shifting the remote positionals (see the health-check step for the
+          # full reasoning).
+          #
+          # Remote exit codes:
+          #   1 = pre-flight/configuration failure; `compose up` never ran.
+          #   2 = `docker compose up -d` failed; the stack may be half-up.
+          set +e
+          ssh roomflow-production bash -s -- "${PROD_DEPLOY_DIR}" "${IMAGE_TAG}" "${PROD_ENV_FILE:-''}" <<'REMOTE_DEPLOY'
+          set -euo pipefail
+
+          if ! . "${1-}/prod-deploy-lib.sh"; then
+            echo "ERROR: cannot load the deploy library from '${1-}/prod-deploy-lib.sh'." >&2
+            echo "       It is shipped by the workflow into the deploy dir; a value that is not that path will fail here." >&2
+            exit 1
+          fi
+
+          TAG="${2-}"
+          ENV_FILE_OVERRIDE="${3-}"
+
+          # Same validation as the runner, re-applied on the host so a stale
+          # runner-side check cannot widen what the host accepts.
+          if ! prod_context "${1-}" "${ENV_FILE_OVERRIDE}"; then
+            exit 1
+          fi
+          if ! validate_image_tag "${TAG}"; then
+            echo "ERROR: invalid image tag (not a 40-character lowercase hex commit SHA)." >&2
+            exit 1
+          fi
+
+          # The required set is read from the compose file's own ${VAR:?}
+          # guards, so it cannot drift from the stack definition. Only NAMES
+          # are ever printed, never values.
+          if ! require_env_vars "${COMPOSE_FILE}" "${ENV_FILE}"; then
+            exit 1
+          fi
+
+          # --project-directory and --env-file are MANDATORY (see the header of
+          # docker/docker-compose.prod.yml). IMAGE_TAG is set for this command
+          # only, so the operator's env file stays untouched.
+          echo "Deploying tag ${TAG} with ${COMPOSE_FILE} (env file: ${ENV_FILE})"
+          if ! IMAGE_TAG="${TAG}" docker compose \
+                 --project-directory "${DEPLOY_DIR}" \
+                 --env-file "${ENV_FILE}" \
+                 -f "${COMPOSE_FILE}" \
+                 up -d; then
+            echo "ERROR: 'docker compose up -d' failed for tag ${TAG}; the stack may be partially recreated." >&2
+            exit 2
+          fi
+          echo "Deployed tag ${TAG}."
+          REMOTE_DEPLOY
+          RC=$?
+          set -e
+
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
+          echo "Remote deploy exit code: ${RC}"
+          exit "${RC}"
+
+      # ---------------------------------------------------------------------
+      # 9. Post-deploy health check ON THE HOST (middleware and backend are
+      #    loopback-bound). health-check.sh exit 2 = host configuration error,
+      #    which deliberately does NOT roll back.
+      # ---------------------------------------------------------------------
+      - name: Post-deploy health check (on the production host)
+        id: healthcheck
+        # Do not fail the job here: the rollback step runs first; the Report
+        # step turns a failure into a red job.
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          # The '' placeholders are LOAD-BEARING (ssh argv space-join; see the
+          # staging health-check step comment for the full reasoning).
+          set +e
+          ssh roomflow-production bash -s -- "${PROD_DEPLOY_DIR}" "${PROD_ENV_FILE:-''}" "${PROD_BACKEND_URL:-''}" "${PROD_FRONTEND_URL:-''}" <<'REMOTE_HEALTHCHECK'
+          set -euo pipefail
+
+          if ! . "${1-}/prod-deploy-lib.sh"; then
+            echo "ERROR: cannot load the deploy library from '${1-}/prod-deploy-lib.sh'." >&2
+            exit 2
+          fi
+
+          ENV_FILE_OVERRIDE="${2-}"
+          BACKEND_OVERRIDE="${3-}"
+          FRONTEND_OVERRIDE="${4-}"
+
+          # A failure here is a HOST configuration problem, not a bad deploy,
+          # so it exits 2 and the workflow does not roll back.
+          if ! prod_context "${1-}" "${ENV_FILE_OVERRIDE}"; then
+            exit 2
+          fi
+          if [ -n "${BACKEND_OVERRIDE}" ] && ! validate_probe_url "${BACKEND_OVERRIDE}"; then
+            echo "ERROR: PROD_BACKEND_URL is not a plain http(s) URL." >&2
+            exit 2
+          fi
+          if [ -n "${FRONTEND_OVERRIDE}" ] && ! validate_probe_url "${FRONTEND_OVERRIDE}"; then
+            echo "ERROR: PROD_FRONTEND_URL is not a plain http(s) URL." >&2
+            exit 2
+          fi
+
+          # The published ports come from the env file (PROD_BACKEND_PORT /
+          # PROD_FRONTEND_PORT), falling back to 28080 / 8082.
+          if ! BACKEND_URL="$(resolve_probe_url backend "${ENV_FILE}" "${BACKEND_OVERRIDE}")"; then
+            exit 2
+          fi
+          if ! FRONTEND_URL="$(resolve_probe_url frontend "${ENV_FILE}" "${FRONTEND_OVERRIDE}")"; then
+            exit 2
+          fi
+
+          echo "Probing backend ${BACKEND_URL} and frontend ${FRONTEND_URL} (ports read from ${ENV_FILE} unless overridden)."
+
+          set +e
+          BACKEND_URL="${BACKEND_URL}" FRONTEND_URL="${FRONTEND_URL}" \
+            bash "${DEPLOY_DIR}/health-check.sh" "${BACKEND_URL}" "${FRONTEND_URL}"
+          RC=$?
+          set -e
+
+          echo "health-check.sh exit code: ${RC} (0 healthy, 1 unhealthy, 2 configuration error)"
+          exit "${RC}"
+          REMOTE_HEALTHCHECK
+          RC=$?
+          set -e
+
+          case "${RC}" in
+            0) RESULT=healthy ;;
+            1) RESULT=unhealthy ;;
+            2) RESULT=config_error ;;
+            *) RESULT=unknown ;;
+          esac
+          echo "result=${RESULT}" >> "$GITHUB_OUTPUT"
+          echo "Health-check exit code ${RC} -> ${RESULT}"
+          exit "${RC}"
+
+      # ---------------------------------------------------------------------
+      # 10. Automatic rollback — IMAGE-LEVEL ONLY. The database is untouched:
+      #     the pre-deploy backup exists in BACKUP_DIR for an operator-driven
+      #     restore (docker/restore.sh) if the release corrupted the schema.
+      #     Same condition set as staging: fires whenever the stack may have
+      #     been mutated and a previous tag exists.
+      # ---------------------------------------------------------------------
+      - name: Roll back to the previously deployed tag
+        id: rollback
+        if: >-
+          always() &&
+          steps.previous-tag.outputs.tag != '' &&
+          ((steps.deploy.outcome == 'failure' && steps.deploy.outputs.rc != '1') ||
+           steps.deploy.outcome == 'cancelled' ||
+           (steps.healthcheck.outcome == 'failure' && steps.healthcheck.outputs.result == '') ||
+           steps.healthcheck.outputs.result == 'unhealthy' ||
+           steps.healthcheck.outputs.result == 'unknown')
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          PREV_TAG: ${{ steps.previous-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo "::warning::Recovering: rolling production back to ${PREV_TAG}."
+
+          set +e
+          ssh roomflow-production bash -s -- "${PROD_DEPLOY_DIR}" "${PREV_TAG}" "${PROD_ENV_FILE:-''}" "${PROD_BACKEND_URL:-''}" "${PROD_FRONTEND_URL:-''}" <<'REMOTE_ROLLBACK'
+          set -euo pipefail
+
+          # Exit codes:
+          #   0 = the previous tag is healthy again
+          #   1 = the rollback was NOT attempted (pre-flight/config error)
+          #   2 = the rollback was attempted and `compose up` failed
+          #   3 = the rollback was attempted; verification inconclusive
+          #       (health-check.sh exit 2)
+          #   4 = the rollback was attempted and the stack came up unhealthy
+          if ! . "${1-}/prod-deploy-lib.sh"; then
+            echo "ROLLBACK: cannot load the deploy library; rollback NOT attempted." >&2
+            exit 1
+          fi
+
+          TAG="${2-}"
+          ENV_FILE_OVERRIDE="${3-}"
+          BACKEND_OVERRIDE="${4-}"
+          FRONTEND_OVERRIDE="${5-}"
+
+          # The SAME pre-flight the deploy ran, from the same libraries.
+          if ! prod_context "${1-}" "${ENV_FILE_OVERRIDE}"; then
+            echo "ROLLBACK: env file unusable; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if ! validate_image_tag "${TAG}"; then
+            echo "ROLLBACK: rollback tag is not a 40-character lowercase hex commit SHA; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if ! require_env_vars "${COMPOSE_FILE}" "${ENV_FILE}"; then
+            echo "ROLLBACK: env file failed the pre-flight; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if [ -n "${BACKEND_OVERRIDE}" ] && ! validate_probe_url "${BACKEND_OVERRIDE}"; then
+            echo "ROLLBACK: invalid PROD_BACKEND_URL override; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if [ -n "${FRONTEND_OVERRIDE}" ] && ! validate_probe_url "${FRONTEND_OVERRIDE}"; then
+            echo "ROLLBACK: invalid PROD_FRONTEND_URL override; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if ! BACKEND_URL="$(resolve_probe_url backend "${ENV_FILE}" "${BACKEND_OVERRIDE}")"; then
+            echo "ROLLBACK: backend probe URL could not be resolved; rollback NOT attempted." >&2
+            exit 1
+          fi
+          if ! FRONTEND_URL="$(resolve_probe_url frontend "${ENV_FILE}" "${FRONTEND_OVERRIDE}")"; then
+            echo "ROLLBACK: frontend probe URL could not be resolved; rollback NOT attempted." >&2
+            exit 1
+          fi
+
+          echo "Rolling back to tag ${TAG} (env file: ${ENV_FILE}, backend ${BACKEND_URL})."
+          if ! IMAGE_TAG="${TAG}" docker compose \
+                 --project-directory "${DEPLOY_DIR}" \
+                 --env-file "${ENV_FILE}" \
+                 -f "${COMPOSE_FILE}" \
+                 up -d; then
+            echo "ROLLBACK: compose up failed for tag ${TAG}." >&2
+            exit 2
+          fi
+
+          set +e
+          BACKEND_URL="${BACKEND_URL}" FRONTEND_URL="${FRONTEND_URL}" \
+            bash "${DEPLOY_DIR}/health-check.sh" "${BACKEND_URL}" "${FRONTEND_URL}"
+          RC=$?
+          set -e
+
+          if [ "${RC}" -eq 0 ]; then
+            echo "ROLLBACK: tag ${TAG} is healthy again."
+            exit 0
+          fi
+          if [ "${RC}" -eq 2 ]; then
+            echo "ROLLBACK: tag ${TAG} was restored, but the verification could not run - health-check.sh exited 2 (configuration error on the host)." >&2
+            exit 3
+          fi
+          echo "ROLLBACK: tag ${TAG} came up but is NOT healthy (health-check.sh exit ${RC})." >&2
+          exit 4
+          REMOTE_ROLLBACK
+          RC=$?
+          set -e
+
+          case "${RC}" in
+            0) HEALTH=healthy ;;
+            1) HEALTH=not_attempted ;;
+            2) HEALTH=compose_failed ;;
+            3) HEALTH=inconclusive ;;
+            4) HEALTH=unhealthy ;;
+            *) HEALTH=unknown ;;
+          esac
+          echo "health=${HEALTH}" >> "$GITHUB_OUTPUT"
+          echo "Rollback exit code ${RC} -> ${HEALTH}"
+          exit "${RC}"
+
+      # ---------------------------------------------------------------------
+      # 11. Diagnostics. NEVER `cat` the host env file and never run
+      #     `docker compose config` (it prints the interpolated env values).
+      #     `ps` and `logs` do not surface the compose file's secrets.
+      # ---------------------------------------------------------------------
+      - name: Collect diagnostics (compose ps + recent logs)
+        if: >-
+          always() &&
+          (steps.backup.outcome != 'success' ||
+           steps.deploy.outcome != 'success' ||
+           steps.healthcheck.outcome != 'success' ||
+           steps.rollback.outcome == 'failure')
+        timeout-minutes: 5
+        run: |
+          # `if: always()` can run before validation did; the allowlist is
+          # therefore re-applied HERE on the runner (the host-side check cannot
+          # help - the payload runs while the remote shell parses the command).
+          set +e
+          if ! . .github/scripts/staging-deploy-lib.sh 2>/dev/null; then
+            echo "diagnostics: the shared deploy library is not available on the runner (checkout or the artifact check did not succeed); skipping host diagnostics rather than handing unvalidated values to ssh."
+            exit 0
+          fi
+          if ! validate_deploy_dir "${PROD_DEPLOY_DIR}"; then
+            echo "diagnostics: PROD_DEPLOY_DIR is not a plain absolute path; skipping host diagnostics."
+            exit 0
+          fi
+          ENV_FILE_ARG=""
+          if validate_env_override "${PROD_ENV_FILE}"; then
+            ENV_FILE_ARG="${PROD_ENV_FILE}"
+          elif [ -n "${PROD_ENV_FILE}" ]; then
+            echo "::warning::PROD_ENV_FILE is not a bare file name inside the deploy dir; diagnostics will not pass it to the host."
+          fi
+          ssh roomflow-production bash -s -- "${PROD_DEPLOY_DIR}" "${ENV_FILE_ARG:-''}" <<'REMOTE_DIAGNOSTICS'
+          set +e
+
+          if ! . "${1-}/prod-deploy-lib.sh"; then
+            echo "diagnostics: deploy library unavailable; skipping compose inspection"
+            exit 0
+          fi
+
+          if ! validate_deploy_dir "${1-}"; then
+            echo "diagnostics: refusing to use an invalid deploy dir"
+            exit 0
+          fi
+          DEPLOY_DIR="${1-}"
+          ENV_FILE_OVERRIDE="${2-}"
+          COMPOSE_FILE="${DEPLOY_DIR}/docker-compose.prod.yml"
+
+          if ! validate_env_override "${ENV_FILE_OVERRIDE}"; then
+            echo "diagnostics: PROD_ENV_FILE is not a bare file name inside the deploy dir; falling back to auto-detect"
+            ENV_FILE_OVERRIDE=""
+          fi
+
+          ENV_FILE="$(resolve_env_file "${DEPLOY_DIR}" "${ENV_FILE_OVERRIDE}")" || ENV_FILE=""
+          if [ -z "${ENV_FILE}" ] || [ ! -f "${ENV_FILE}" ]; then
+            echo "diagnostics: no env file found in ${DEPLOY_DIR} (.env.production, then .env); skipping compose inspection"
+            exit 0
+          fi
+
+          echo "=== docker compose ps ==="
+          docker compose --project-directory "${DEPLOY_DIR}" --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" ps
+          echo "=== docker compose logs --tail=200 (after any rollback) ==="
+          docker compose --project-directory "${DEPLOY_DIR}" --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" logs --tail=200 --no-color
+          exit 0
+          REMOTE_DIAGNOSTICS
+          echo "Diagnostics collected."
+
+      # ---------------------------------------------------------------------
+      # 12. Summary + job status. A failed deploy or health check always fails
+      #     the job, rollback or not.
+      # ---------------------------------------------------------------------
+      - name: Report deploy result
+        if: always()
+        timeout-minutes: 2
+        env:
+          TAG: ${{ steps.resolve-tag.outputs.tag }}
+          TAG_SOURCE: ${{ steps.resolve-tag.outputs.source }}
+          PREV_TAG: ${{ steps.previous-tag.outputs.tag }}
+          BACKUP_RC: ${{ steps.backup.outputs.rc }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          DEPLOY_RC: ${{ steps.deploy.outputs.rc }}
+          HEALTH_RESULT: ${{ steps.healthcheck.outputs.result }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          ROLLBACK_HEALTH: ${{ steps.rollback.outputs.health }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${PREV_TAG}" ]; then
+            PREV_DISPLAY="\`${PREV_TAG}\`"
+          else
+            PREV_DISPLAY="_none detected (first deploy, or non-SHA tag)_"
+          fi
+
+          case "${BACKUP_RC}" in
+            0) BACKUP_DISPLAY="pre-deploy dump written and verified (see the backup step log for the path)" ;;
+            3) BACKUP_DISPLAY="skipped - no running database (first deploy)" ;;
+            '') BACKUP_DISPLAY="not run" ;;
+            *) BACKUP_DISPLAY="FAILED (exit ${BACKUP_RC}) - the deploy was refused before it ran" ;;
+          esac
+
+          if [ -n "${ROLLBACK_HEALTH}" ]; then
+            case "${ROLLBACK_HEALTH}" in
+              healthy) ROLLBACK_DISPLAY="yes - previous version \`${PREV_TAG}\` is healthy again (image-level only; the database was NOT touched - the pre-deploy backup is on the host if a data restore is needed)" ;;
+              unhealthy) ROLLBACK_DISPLAY="attempted, but the previous version is **not healthy**" ;;
+              compose_failed) ROLLBACK_DISPLAY="attempted, but \`docker compose up -d\` failed - production is in an **unknown** state" ;;
+              inconclusive) ROLLBACK_DISPLAY="attempted; the restored stack could not be verified (health-check.sh exited 2) - treat the state as **unknown**" ;;
+              not_attempted) ROLLBACK_DISPLAY="**not performed** - the rollback pre-flight rejected the configuration, so nothing on the host was changed by it" ;;
+              *) ROLLBACK_DISPLAY="${ROLLBACK_HEALTH}" ;;
+            esac
+          elif [ "${ROLLBACK_OUTCOME}" = "skipped" ]; then
+            if [ -n "${PREV_TAG}" ]; then
+              case "${DEPLOY_OUTCOME}:${DEPLOY_RC}:${HEALTH_RESULT}" in
+                failure:1:*)
+                  ROLLBACK_DISPLAY="not attempted - the deploy stopped during its pre-flight (remote exit 1), so nothing on the host was changed" ;;
+                success:0:healthy)
+                  ROLLBACK_DISPLAY="not attempted - the deploy succeeded and the health check passed" ;;
+                success:*:config_error)
+                  ROLLBACK_DISPLAY="not attempted - the health check could not run (health-check.sh exit 2, a configuration error on the host), so production was deliberately left as deployed" ;;
+                *)
+                  ROLLBACK_DISPLAY="not attempted (deploy ${DEPLOY_OUTCOME:-unknown}, health check ${HEALTH_RESULT:-not run}) - see the step outcomes above" ;;
+              esac
+            else
+              ROLLBACK_DISPLAY="**impossible - no previous tag was captured; production is left on the failed version**"
+            fi
+          else
+            ROLLBACK_DISPLAY="${ROLLBACK_OUTCOME:-unknown} (no detail output)"
+          fi
+
+          {
+            echo "## Production deploy"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Resolved image tag | \`${TAG}\` |"
+            echo "| Tag source | ${TAG_SOURCE} |"
+            echo "| Previous (rollback) tag | ${PREV_DISPLAY} |"
+            echo "| Pre-deploy database backup | ${BACKUP_DISPLAY} |"
+            echo "| \`docker compose up -d\` | ${DEPLOY_OUTCOME} (remote exit ${DEPLOY_RC:-n/a}) |"
+            echo "| Health check (on host) | ${HEALTH_RESULT:-n/a} |"
+            echo "| Rollback (image-level) | ${ROLLBACK_DISPLAY} |"
+            echo "| Run | [${GITHUB_RUN_ID}](${RUN_URL}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "${TAG}" ]; then
+            echo "::error::No image tag was resolved, so the deploy never started. See the failing step above."
+            exit 1
+          fi
+
+          if [ "${DEPLOY_OUTCOME}" != "success" ]; then
+            if [ "${DEPLOY_RC}" = "1" ]; then
+              echo "::error::The deploy stopped during its pre-flight (remote exit 1), so nothing on the host was changed. See the failed check above. Rollback: ${ROLLBACK_DISPLAY}."
+            else
+              echo "::error::\`docker compose up -d\` did not succeed (outcome ${DEPLOY_OUTCOME}, remote exit ${DEPLOY_RC:-n/a}); production was not verified. Rollback: ${ROLLBACK_DISPLAY}. The pre-deploy backup remains on the host for an operator-driven data restore if needed (docker/restore.sh)."
+            fi
+            exit 1
+          fi
+
+          if [ "${HEALTH_RESULT}" != "healthy" ]; then
+            if [ "${HEALTH_RESULT}" = "config_error" ]; then
+              echo "::error::The health check could not run: docker/health-check.sh exited 2 (configuration error - for example no curl on the host, a non-numeric tuning value, or a PROD_*_URL that disagrees with the port in the env file). This is NOT a bad deploy and production was deliberately left as deployed - fix the host environment and re-run."
+              exit 1
+            fi
+            if [ -z "${PREV_TAG}" ]; then
+              echo "::error::Health check did not pass for tag ${TAG} (${HEALTH_RESULT:-unknown}) and no previous tag was captured, so rollback was IMPOSSIBLE. Production is left running the unhealthy version - manual intervention required."
+            elif [ "${ROLLBACK_HEALTH}" = "healthy" ]; then
+              echo "::error::Health check did not pass for tag ${TAG} (${HEALTH_RESULT:-unknown}); rollback to ${PREV_TAG} was performed and is healthy. Production is serving ${PREV_TAG} - investigate before redeploying."
+            else
+              echo "::error::Health check did not pass for tag ${TAG} (${HEALTH_RESULT:-unknown}) and the rollback to ${PREV_TAG} did not come back healthy (${ROLLBACK_HEALTH:-unknown}). Production is in an UNKNOWN state - manual intervention required."
+            fi
+            exit 1
+          fi
+
+          echo "Production is healthy on tag ${TAG}."
