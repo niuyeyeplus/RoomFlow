@@ -1741,3 +1741,24 @@ live on the default branch, so the chain activates only post-merge).
   without it the job falls back to `StrictHostKeyChecking=accept-new` with a
   warning, mirroring `deploy-staging.yml`. The secret *is* set today, so
   strict pinning applies.
+
+### Execution record (2026-09-17, local run via SSH tunnel)
+
+Executed locally against the live staging stack on tag `24f7371` via the
+documented tunnel path (`ssh -L 8081:127.0.0.1:8081`, §7): the workflow file
+is not yet on the default branch, so `e2e-staging.yml` cannot be dispatched
+until this PR merges — the Actions run is pending, this record covers the
+identical suite run by hand.
+
+| Item | Result |
+| --- | --- |
+| `STAGING_ADMIN_PASSWORD` / `STAGING_E2E_PASSWORD` | created as `staging` environment secrets on 2026-09-17 (stdin upload, never echoed) |
+| Admin credential rotation | old plaintext unknown → new random password, BCrypt hash written to the `account` row and to `.env.staging` (`ADMIN_PASSWORD_HASH`, single-quoted) on the host; backend restarted, `healthy` |
+| Admin login verification | `POST /api/auth/login` as `admin` → `code:0` (verified through the tunnel) |
+| E2E probe account | `e2e_probe_01` registered + login verified (idempotent probe for future runs) |
+| Suite run 1 (spec as written) | 5/6 — `real-time lifecycle` failed: `JWT_ACCESS_TTL` is 15m and the real-time waits (~27min) outlived the test-start tokens; every post-wait API call 401'd as `data:null`. Spec bug, not a product bug — fixed in `d458c35` (re-login after each real-time wait) |
+| Targeted re-run of `real-time lifecycle` | **PASS** 39.3m — end-early via UI, auto-end observed by the real sweep, `MEETING_ENDED` via MQ to organizer + participant |
+| Full suite re-run on `d458c35` | **6/6 PASS** in 29.7m — auto-end observed 64s after the end boundary (one 60s sweep tick). Single clean green run covering all 12 acceptance items |
+| Leak scan | 0 hits: no password substring in any Playwright log or `test-results` artifact (greped for both values) |
+| Residual data | `stg_*`/`e2e_probe_01` accounts remain (no delete-user API); 0 `ACTIVE` `STG*` meetings left behind — suite deletes/ends/cancels what it creates |
+| `MeetingLifecycleIT` streak | fix `34f7f96` + 8 consecutive green CI runs including both runs on `d458c35` (`35190547528` push, `35190553892` PR) |
