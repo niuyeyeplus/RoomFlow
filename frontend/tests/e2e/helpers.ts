@@ -227,10 +227,17 @@ export function beijingIso(d: Date): string {
   return new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 19) + '+08:00'
 }
 
-/** 'YYYY-MM-DD HH:mm' in browser-local time (test env TZ = Asia/Shanghai). */
+/**
+ * 'YYYY-MM-DD HH:mm' as a BEIJING wall clock, matching how the app treats the
+ * el-date-picker value: the contract labels the picked wall clock '+08:00'
+ * (toBeijingIso) and playwright.config.ts pins the browser to
+ * timezoneId 'Asia/Shanghai'. Formatting via local getters instead would emit
+ * the runner's TZ (UTC on CI) — a string the picker then parses as Beijing
+ * time, landing hours in the past and tripping '开始时间不能早于当前时间'.
+ */
 export function fmtPicker(d: Date): string {
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+  const iso = beijingIso(d) // 'YYYY-MM-DDTHH:mm:ss+08:00'
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)}`
 }
 
 // ---------- UI flows ----------

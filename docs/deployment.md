@@ -1762,3 +1762,33 @@ identical suite run by hand.
 | Leak scan | 0 hits: no password substring in any Playwright log or `test-results` artifact (greped for both values) |
 | Residual data | `stg_*`/`e2e_probe_01` accounts remain (no delete-user API); 0 `ACTIVE` `STG*` meetings left behind — suite deletes/ends/cancels what it creates |
 | `MeetingLifecycleIT` streak | fix `34f7f96` + 8 consecutive green CI runs including both runs on `d458c35` (`35190547528` push, `35190553892` PR) |
+
+### First Actions-driven chain after the PR #9 merge (2026-09-17)
+
+PR #9 merged as `77d3ecf`; the full chain then ran on real infrastructure:
+
+| Item | Result |
+| --- | --- |
+| CI on `main` (`77d3ecf`) | run [35197667415](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35197667415) — all 4 jobs success |
+| `Deploy Staging` | run [35198019177](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35198019177) — `workflow_run` trigger, environment approval granted, deployed tag `77d3ecfc…c10cb10c`, host reported **healthy** |
+| `E2E Staging` auto-trigger | run [35198256203](https://github.com/niuyeyeplus/RoomFlow/actions/runs/35198256203) — confirmed: fired automatically via `workflow_run` after the successful deploy, environment approval granted, SSH tunnel + stack reachable (UI 200 / API 401) |
+| Suite result | **4/6, 2 failed** — `meeting lifecycle` and `staging-smoke`, each after 3 attempts |
+
+**Failure analysis — a real test-side timezone bug, not a product bug.** Both
+failures were `POST /api/meetings` never being sent: the create form blocked
+submit with `开始时间不能早于当前时间`. Root cause: `fmtPicker` formatted the
+`Date` via Node's *local* getters, but `playwright.config.ts` pins the browser
+to `timezoneId: 'Asia/Shanghai'` and the app labels the picked wall clock
+`+08:00` (`toBeijingIso`). On the UTC GitHub runner the typed string was the
+UTC wall clock, which the picker parsed as Beijing time — hours in the past.
+Locally invisible because the dev machine is already UTC+8; the two API-driven
+tests and the UI flows that do not type a datetime were unaffected.
+
+**Fix** (`0e6bf3d`, PR #10): `fmtPicker` now formats via `beijingIso` — a
+Beijing wall clock on any runner TZ. Verified under runner-equivalent
+conditions: the two failed tests were re-run locally against live staging
+through the tunnel with `TZ=UTC` on the Node side — **2/2 passed** (lifecycle
+50.6s, smoke 1.4m). A `workflow_dispatch` verification on the fix branch is
+not possible: the `staging` environment's branch policy allows `main` only —
+correct protection, not bypassed. A green 6/6 Actions run follows once PR #10
+merges and the deploy chain re-triggers.
