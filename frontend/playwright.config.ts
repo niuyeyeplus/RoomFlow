@@ -92,7 +92,7 @@ export default defineConfig({
       name: 'chromium',
       // The staging specs belong to the `staging` project only, so a
       // default (no staging env) run never even collects them.
-      testIgnore: /staging-smoke\.spec\.ts/,
+      testIgnore: /staging-.*\.spec\.ts/,
       // Inherits the dev `use.baseURL` above; it must never see a staging URL.
       use: { ...devices['Desktop Chrome'] }
     },
