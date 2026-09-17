@@ -67,6 +67,14 @@ export const TEST_PASSWORD = 'E2e#Passw0rd'
  */
 export const STAGING_PASSWORD = process.env.STAGING_E2E_PASSWORD ?? ''
 
+/**
+ * Password of the seeded staging 'admin' account, used by the staging acceptance
+ * spec's admin-side flows (room management, admin-overrides-organizer). Same rules
+ * as STAGING_PASSWORD: env-only, never a literal, never logged. Empty when
+ * STAGING_ADMIN_PASSWORD is unset - admin-dependent tests skip (fail-closed).
+ */
+export const STAGING_ADMIN_PASSWORD = process.env.STAGING_ADMIN_PASSWORD ?? ''
+
 interface Result<T> {
   code: number
   message: string
