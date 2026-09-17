@@ -683,6 +683,10 @@ test.describe('staging-acceptance', () => {
     )
     await sleep(waitStart)
 
+    // JWT_ACCESS_TTL is 15m: the boundary wait above may already have outlived
+    // the tokens minted at test start — re-login before any API call below.
+    const orgMid = await apiLogin(organizer, STAGING_PASSWORD)
+
     // ---- end-early via the real UI ----
     await uiLogin(page, organizer, STAGING_PASSWORD)
     await page.goto(`/meetings/${mA.id}`)
@@ -697,17 +701,17 @@ test.describe('staging-acceptance', () => {
     await confirmEnd.getByRole('button', { name: END_EARLY_BTN }).click()
     expect((await endRespPromise).status(), 'end-early via UI').toBe(200)
     await expect(page.locator('.el-tag', { hasText: '已提前结束' }).first()).toBeVisible()
-    const endedA = await getMeeting(orgTokens.accessToken, mA.id)
+    const endedA = await getMeeting(orgMid.accessToken, mA.id)
     expect(endedA.data?.status).toBe('ENDED')
     expect(endedA.data?.endedEarly).toBe(true)
 
     // The released tail is bookable again: a legal future slot overlapping the
     // old meeting's remaining interval proves the release (the part in the past
     // cannot be rebooked by definition).
-    const tail = await earliestFreeSlot(orgTokens.accessToken, roomA.id, 15)
+    const tail = await earliestFreeSlot(orgMid.accessToken, roomA.id, 15)
     expect(tail.start.getTime() < slotA.end.getTime()).toBe(true)
     const rebooked = await createMeetingApi(
-      orgTokens.accessToken,
+      orgMid.accessToken,
       roomA.id,
       tail.start,
       tail.end,
@@ -723,6 +727,11 @@ test.describe('staging-acceptance', () => {
       )
       await sleep(waitEnd)
     }
+    // The real-time waits above have definitely outlived JWT_ACCESS_TTL (15m),
+    // so every API call below uses freshly minted tokens — polling with an
+    // expired token surfaces as data:null, indistinguishable from "not ENDED".
+    const orgEnd = await apiLogin(organizer, STAGING_PASSWORD)
+    const joinEnd = await apiLogin(joiner, STAGING_PASSWORD)
     const sweepDeadline = Date.now() + SWEEP_GRACE_MS
     await expect(async () => {
       expect(
@@ -730,10 +739,10 @@ test.describe('staging-acceptance', () => {
         `meeting B still not ENDED ${((Date.now() - slotB.end.getTime()) / 1000).toFixed(0)}s ` +
           'after its end boundary (staging sweep interval is the default 60s)'
       ).toBe(true)
-      const d = await getMeeting(orgTokens.accessToken, mB.id)
+      const d = await getMeeting(orgEnd.accessToken, mB.id)
       expect(d.data?.status, `mB status: ${JSON.stringify(d.data)}`).toBe('ENDED')
     }).toPass({ timeout: SWEEP_GRACE_MS, intervals: [10_000, 15_000, 30_000] })
-    const endedB = await getMeeting(orgTokens.accessToken, mB.id)
+    const endedB = await getMeeting(orgEnd.accessToken, mB.id)
     expect(endedB.data?.endedEarly).toBe(false)
     console.log(
       `[staging-acceptance] auto-end observed ` +
@@ -743,8 +752,8 @@ test.describe('staging-acceptance', () => {
 
     // MEETING_ENDED reaches every active participant over the real MQ chain.
     await expect(async () => {
-      const orgNotes = await notifications(orgTokens.accessToken)
-      const joinNotes = await notifications(joinTokens.accessToken)
+      const orgNotes = await notifications(orgEnd.accessToken)
+      const joinNotes = await notifications(joinEnd.accessToken)
       expect(
         orgNotes.find((n) => n.type === 'MEETING_ENDED' && n.meetingId === mB.id),
         'organizer MEETING_ENDED'
@@ -762,7 +771,7 @@ test.describe('staging-acceptance', () => {
 
     // ---- cleanup: delete every meeting this test created; scratch room off ----
     for (const id of [mA.id, mB.id, rebooked.id]) {
-      const d = await apiFetch('DELETE', `/api/meetings/${id}`, { token: orgTokens.accessToken })
+      const d = await apiFetch('DELETE', `/api/meetings/${id}`, { token: orgEnd.accessToken })
       expect(d.status, `cleanup delete meeting ${id}`).toBe(200)
     }
     if (scratchRoomId !== null) {
