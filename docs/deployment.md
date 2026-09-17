@@ -1198,13 +1198,31 @@ TLS in this slice; see §10.
 
 ---
 
-## 8. Running the staging E2E smoke test
+## 8. Running the staging E2E suite
 
-`frontend/tests/e2e/staging-smoke.spec.ts` is the core acceptance flow against a
-**deployed** stack: register two users via the API → log in through the real UI →
-create a meeting → second user signs up (报名) → the organizer receives the signup
-notification via RabbitMQ → marks it read. No dev server, no mocks, no `webServer`
-block.
+The `staging` Playwright project matches every `staging-*.spec.ts` file:
+
+- `frontend/tests/e2e/staging-smoke.spec.ts` — the core acceptance flow against a
+  **deployed** stack: register two users via the API → log in through the real UI →
+  create a meeting → second user signs up (报名) → the organizer receives the signup
+  notification via RabbitMQ → marks it read. No dev server, no mocks, no
+  `webServer` block.
+- `frontend/tests/e2e/staging-acceptance.spec.ts` — the full acceptance list:
+  admin room management (create/edit/disable/enable/delete via the real admin UI,
+  cross-checked over the API), the normal-user admin-surface rejection, the whole
+  meeting lifecycle (create/update/cancel/logical-delete), signup/withdraw/rejoin/
+  kick/permanent-ban participant flows, notification delivery + mark-read, the
+  permission boundaries, and — in real wall-clock time — end-early plus the
+  scheduler's auto-end sweep. See the file's header for why the timing tests wait
+  for real 15-minute boundaries (the contract forbids past-start bookings and the
+  staging database is unreachable from outside, so the dev suite's MySQL rewrite
+  is impossible there).
+
+The canonical executor is the `E2E Staging` GitHub Actions workflow
+(`.github/workflows/e2e-staging.yml`): `environment: staging`, an SSH tunnel to
+the loopback-bound frontend, then `npm run test:e2e:staging`. It runs on
+`workflow_dispatch` and after every successful `Deploy Staging` on `main` —
+never on push/PR.
 
 ### Two independent target chains
 
@@ -1218,7 +1236,7 @@ dev / CI   — the `chromium` project (every committed spec except the smoke one
   UI  base : E2E_BASE_URL     -> http://localhost:5173   (global `use.baseURL`)
   API base : E2E_API_BASE_URL -> http://localhost:8080   (tests/e2e/helpers.ts)
 
-staging    — the `staging` project (staging-smoke.spec.ts only)
+staging    — the `staging` project (every staging-*.spec.ts file)
   UI  base : PLAYWRIGHT_BASE_URL -> STAGING_BASE_URL     (that project's OWN use.baseURL)
   API base : STAGING_API_BASE_URL -> the staging UI URL  (same origin)
 ```
@@ -1252,25 +1270,34 @@ Key consequences — several of these are the opposite of the earlier design:
   UI while every helper call went to the staging API. Run the staging project on
   its own and keep the staging variables out of a dev run.
 
-### Required credential: `STAGING_E2E_PASSWORD`
+### Required credentials: `STAGING_E2E_PASSWORD` and `STAGING_ADMIN_PASSWORD`
 
-The smoke spec creates **real accounts with a real password** on a shared,
+The staging specs create **real accounts with a real password** on a shared,
 publicly reachable database, and the project has **no delete-user API**, so those
 accounts stay login-capable afterwards. The password the rest of the dev suite uses
 (`helpers.TEST_PASSWORD`) is committed to this public repository, so reusing it on
 staging would leave accounts whose credentials are world-known — and organizers can
-read participant data.
+read participant data. The acceptance spec additionally logs in as the seeded
+`admin` account (room management UI, admin-overrides-organizer checks), whose
+password is known only to the operator who generated `ADMIN_PASSWORD_HASH`.
 
-The staging password is therefore supplied **from the environment only**:
+Both passwords are therefore supplied **from the environment only**:
 
-- It is a **local / CI environment variable, not a GitHub secret** — nothing in
-  `deploy-staging.yml` reads it, and no secret of this name exists.
-- `npm run test:e2e:staging` **refuses to start without it**: the
-  `pretest:e2e:staging` hook in `frontend/package.json` checks for a staging URL and
-  then for `STAGING_E2E_PASSWORD`, and fails with an actionable message instead of
-  letting Playwright report `Project(s) "staging" not found`.
-- There is **no fallback** to the old literal dev password: `STAGING_PASSWORD` in
-  `helpers.ts` resolves to `''` when the variable is unset — fail-closed.
+- In CI they are **environment-scoped secrets on `staging`**
+  (`STAGING_E2E_PASSWORD`, `STAGING_ADMIN_PASSWORD`), readable only by jobs that
+  pass the environment gate — see the `E2E Staging` workflow header.
+- `npm run test:e2e:staging` **refuses to start without them**: the
+  `pretest:e2e:staging` hook in `frontend/package.json` checks for a staging URL,
+  then for `STAGING_E2E_PASSWORD`, then for `STAGING_ADMIN_PASSWORD`, and fails
+  with an actionable message instead of letting Playwright report
+  `Project(s) "staging" not found`.
+- There is **no fallback** to the old literal dev password: `STAGING_PASSWORD` and
+  `STAGING_ADMIN_PASSWORD` in `helpers.ts` resolve to `''` when unset —
+  fail-closed, and admin-dependent tests skip.
+- The staging Playwright project runs with **`trace: 'off'` and `video: 'off'`**
+  (screenshots on failure only): a retained trace captures DOM state including
+  input values, and run artifacts are downloadable — a typed credential must never
+  reach one.
 
 ### Command
 
@@ -1280,6 +1307,7 @@ npx playwright install chromium     # one-off; browsers are not installed by npm
 
 STAGING_BASE_URL=https://staging.example.com \
 STAGING_E2E_PASSWORD='<a password that lives outside this repository>' \
+STAGING_ADMIN_PASSWORD='<the seeded admin password>' \
 npm run test:e2e:staging
 ```
 
@@ -1299,17 +1327,21 @@ npm run test:e2e:staging
 
 ### Residual exposure (documented, not solved)
 
-**There is no delete-user or meeting-cancel API in this project, so every run
-permanently adds two accounts and one meeting to the shared staging database.**
-The env-supplied password is the most this spec can do from here: cleaning the rows
-up requires a backend API that does not exist yet. Until then the mitigation is
-operational — treat the staging database as dirty, keep it off the public internet,
-and rotate `STAGING_E2E_PASSWORD` if it leaks.
+**There is no delete-user API in this project, so every run permanently adds its
+registered accounts to the shared staging database** (the smoke spec: two; the
+acceptance spec: up to six across its tests). Meetings and rooms, by contrast,
+are cleaned up: the acceptance spec cancels or deletes every meeting it creates
+and disables/deletes every scratch room via the API. The env-supplied password is
+the most the specs can do for the leftover accounts — deleting them requires a
+backend API that does not exist yet. Until then the mitigation is operational —
+treat the staging database as dirty, keep it off the public internet, and rotate
+`STAGING_E2E_PASSWORD` if it leaks. The accounts are identifiable by their
+`stg_*` username prefixes.
 
 Two further caveats, both real: staging data is a **shared** database (other runs,
-manual testing and seeded demo data live in it), so the spec names every entity
-uniquely and assumes nothing about emptiness; and because the organizer account is
-created fresh by the run, its inbox contains only the notification this run
+manual testing and seeded demo data live in it), so the specs name every entity
+uniquely and assume nothing about emptiness; and because the test accounts are
+created fresh by the run, their inboxes contain only the notifications that run
 produced, which is why the notification assertions are unambiguous even on a dirty
 database.
 
@@ -1364,65 +1396,34 @@ login never runs and nothing is stored.
 
 Read this section before trusting anything above.
 
-**No staging host exists yet.** Nothing in this slice has been deployed to, or
-verified against, a real staging environment. There is no live staging URL, no
-provisioned host, and no record of a successful (or failed) staging deploy: the
-`Deploy Staging` workflow has never run, and GitHub does not even list it as a
-workflow on the default branch. The artifacts have been **statically checked and
-exercised locally against stubs**, never deployed.
+**A staging host exists and is deployed** — see §12 for the first-deployment
+record and §13 for the acceptance-completion record. Host `20.205.103.75`, SSH
+port 2222, deploy user `deploy`, deploy dir `/opt/roomflow/staging`, env file
+`.env.staging`; the stack runs healthy on the merged `main` image tag.
 
-**The default branch is `ci/github-actions`, not `main`.** This is a repository
-configuration decision, not a code defect, and it is the highest operational risk
-in this slice: a green CI run with no deploy, silently (see
-[§1](#the-default-branch-caveat)). The user must decide the canonical deploy branch
-and ensure the workflow file exists on the default branch before relying on the
-automatic path.
+**The default branch is now `main`** (previously `ci/github-actions`), so the
+`workflow_run` chain CI → Deploy Staging fires as designed on every merge.
 
-**The `staging` environment must be configured by a human.** GitHub auto-creates a
-referenced environment with no protection rules, so as shipped the `environment:
-staging` gate is inert: until required reviewers, a deployment branch policy and
-environment-scoped secrets are in place, the deploy key is reachable from a
-workflow run on any branch ([§2.1](#21-the-staging-github-environment-required-and-inert-until-configured)).
+**The `staging` environment is configured**: required reviewers
+(`niuyeyeplus`, `prevent_self_review: false`), a deployment branch policy, and
+the credential secrets at environment scope. Every deploy and every E2E run
+pauses at that gate until approved.
 
-**`PLAN.md` lists the deploy host and domain as open questions** (Open Questions 8
-and 9: CI/deploy permissions, the deployment server SSH keys and server resources
-"待确认"; and "ask the user for the domain before deploying"). The user must still
-provide: the host, the SSH user, the deploy directory if it differs from the
-default, the domain, and the CORS origins. **TLS/HTTPS is explicitly out of scope**
-for this slice — the frontend is published over plain HTTP on its configurable
-port, and nothing here terminates TLS.
+**TLS/HTTPS remains out of scope** — the frontend is published over plain HTTP on
+its configurable port, and nothing here terminates TLS. The port is not publicly
+reachable today (NSG), so the documented access path is the SSH tunnel (§7, §8).
 
-**What could not be verified without a real host:**
+**What remains unverified or is a residual exposure** (supersedes the former
+"could not be verified without a real host" list — the health check, compose
+convergence, SSH path, rollback path, Flyway-on-staging and the E2E smoke spec
+were all exercised for real during the first deployment, §12):
 
-- Live health-check behaviour — `docker/health-check.sh` has never run against a
-  running staging stack; only its syntax has been checked (`bash -n`).
-- Any live `docker compose` behaviour at all — see the validation note below.
-- GHCR authentication from the host, including the (conditional) `docker login`
-  path. What *has* been verified independently is that both images are pullable
-  **anonymously** from GHCR for the SHAs CI pushed (an anonymous manifest `GET`
-  returns HTTP 200), which is why `GHCR_READ_TOKEN` is not required by default.
-- The automatic rollback path — never executed. Neither the "previous tag
-  captured" branch, nor the exit-code mapping (`0`/`1`/`2`/`3`/`4`), nor the
-  "the previous version is not healthy either" branch.
-- The conditional rollback `if:` expression as a whole: it mixes `always()`,
-  step outcomes and an empty-output arm; it has been read, not exercised.
-- SSH from a GitHub runner to the staging host (key install, host-key pinning,
-  `BatchMode`, port overrides).
-- Whether `docker compose up -d` converges cleanly from a cold start, whether
-  health-gated `depends_on` ordering behaves as intended with the real image
-  startup times, and which Compose version the staging host runs (which decides
-  how it treats an unescaped `$` in an env-file value).
-- The middleware/E2E flow against a real staging stack: **the E2E smoke spec has
-  never executed** — it requires both a staging base URL and
-  `STAGING_E2E_PASSWORD`, and no such host or password exists. Its selectors and
-  API assumptions are therefore unproven.
-- Flyway migration behaviour on a fresh staging database (`V1`/`V2`) — verified in
-  CI integration tests against Testcontainers, not on a staging host.
-- The `workflow_run` trigger has never fired, and (because of the default-branch
-  caveat) cannot fire from `main` as things stand.
-- Anything involving the `staging` GitHub Environment: the environment has not
-  been created, so the approval gate and the environment-scoped secret delivery
-  are entirely untested.
+- The rollback branch "the previous version is not healthy either" has never
+  fired; the happy-path rollback was exercised once (§12).
+- A fresh-host cold start (first `compose up` on an empty volume) has only
+  happened once; repeat-provisioning behaviour is untested.
+- The E2E smoke spec's later assertions were proven on staging; the acceptance
+  spec added by this slice is verified in §13.
 
 **Validation that was actually performed, and what was not.** The environment in
 which these artifacts were revised has **no `docker` CLI, no `shellcheck` and no
@@ -1463,14 +1464,10 @@ earlier revision of this document described `STAGING_SSH_PORT` as an unvalidated
 gap. That is no longer the case: the port, `STAGING_HOST` and `STAGING_USER` are
 each refused before the config file is written if they could start a new directive,
 and `GHCR_USER` is refused if it holds a single quote or a line break
-([§3](#3-ssh-deploy-key-setup)). The caveat is the one that applies to all of this
-section: **no staging host exists**, so those guards have been read and reasoned
-about, not executed against a live runner. They are fail-closed by construction —
-a rejected value is never written, and a value that got past them would break ssh's
-parse of the whole file rather than quietly taking effect — but "the guard is
-present in the workflow" is a static claim, not deploy evidence. The SSH path
-itself remains unexercised (see the "What could not be verified without a real
-host" list above).
+([§3](#3-ssh-deploy-key-setup)). These guards have since been exercised on real
+runner-to-host deploys (§12): they are fail-closed by construction — a rejected
+value is never written, and a value that got past them would break ssh's parse of
+the whole file rather than quietly taking effect.
 
 **Other accepted trade-offs carried from the artifacts (not bugs, but real):**
 
@@ -1488,9 +1485,10 @@ host" list above).
 - A rollback re-deploys an older image **against the current database**. Flyway
   migrations are forward-only, so a rollback across a schema change can come up
   unhealthy; there is no database rollback in this slice.
-- The E2E smoke spec leaves two accounts and one meeting behind on the shared
-  staging database on every run, because no delete-user or meeting-cancel API
-  exists ([§8](#8-running-the-staging-e2e-smoke-test)).
+- The staging E2E specs leave their registered accounts behind on the shared
+  staging database on every run, because no delete-user API exists; meetings and
+  rooms created by the acceptance spec are cleaned up
+  ([§8](#8-running-the-staging-e2e-suite)).
 - The deploy workflow ships `docker-compose.staging.yml`, `health-check.sh` and
   `staging-deploy-lib.sh` from the deployed revision but **never ships
   `.env.staging.example`**, even though its own error message suggests

@@ -1,0 +1,274 @@
+# Staging E2E (Playwright) — runs the `staging` project (staging-*.spec.ts)
+# against the DEPLOYED staging stack through an SSH tunnel.
+#
+# WHY A TUNNEL: the staging frontend port (8081) is not publicly reachable and
+# every middleware/backend port is loopback-bound on the host. The runner
+# reaches the stack exactly like an operator does: an SSH local-forward of
+# 8081, then PLAYWRIGHT_BASE_URL=http://localhost:8081. nginx on the host
+# proxies /api/ to the backend on the same origin, so one forwarded port
+# covers both the SPA and the API (helpers.ts derives API_BASE from the same
+# staging URL — the UI and API can never split across two environments).
+#
+# TRIGGERS:
+#   workflow_dispatch - manual acceptance run (any ref the file exists on).
+#   workflow_run      - after a successful `Deploy Staging` on main, so every
+#                       real deploy is re-verified end to end. NOT on push/PR:
+#                       staging specs must never run against a dev stack or a
+#                       pull request's undeployed code, and every run writes to
+#                       the shared staging database.
+#
+# SECRETS (all environment-scoped on `staging`; the job's `environment:`
+# declaration is what makes them reachable):
+#   STAGING_SSH_PRIVATE_KEY  deploy key on the staging host (same as deploy)
+#   STAGING_HOST / STAGING_USER / STAGING_KNOWN_HOSTS
+#   STAGING_E2E_PASSWORD     password for accounts the specs register
+#   STAGING_ADMIN_PASSWORD   password of the seeded `admin` account
+# The passwords are only ever env-mapped into the Playwright step. They are
+# never echoed, never placed on an ssh command line, and the staging project's
+# Playwright config keeps trace/video OFF so a retained artifact cannot carry
+# a typed credential (see playwright.config.ts). The fail-fast step below
+# refuses to run when a required secret is absent.
+#
+# VARIABLES: STAGING_SSH_PORT (default 22; the host uses 2222).
+#
+# TIME BUDGET: the acceptance spec books the earliest legal 15-minute-boundary
+# slots and waits for real time to pass (no DB access through the tunnel), so
+# the 'real-time lifecycle' test alone can take ~35 minutes. Step timeouts:
+#   checkout 2 + node 2 + npm ci 5 + playwright install 8 + secrets 1 +
+#   ssh 2 + tunnel 2 + tests 65 + close tunnel 1 + upload 3 = 91 min; the job
+#   timeout of 100 min is strictly greater, so the job timeout can never fire
+#   mid-step.
+
+name: E2E Staging
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Deploy Staging]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Serialize staging E2E: the specs share one real database and one tunnel port.
+concurrency:
+  group: e2e-staging
+  cancel-in-progress: false
+
+jobs:
+  e2e-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 100
+    # Only follow a successful Deploy Staging on main (mirrors deploy-staging.yml's
+    # own belt-and-braces guard); workflow_dispatch always runs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 2
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        timeout-minutes: 2
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: 'frontend/package-lock.json'
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        timeout-minutes: 5
+        run: npm ci
+
+      - name: Install Playwright chromium
+        working-directory: frontend
+        timeout-minutes: 8
+        run: npx playwright install --with-deps chromium
+
+      - name: Check required environment secrets are present
+        timeout-minutes: 1
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+          STAGING_USER: ${{ secrets.STAGING_USER }}
+          STAGING_E2E_PASSWORD: ${{ secrets.STAGING_E2E_PASSWORD }}
+          STAGING_ADMIN_PASSWORD: ${{ secrets.STAGING_ADMIN_PASSWORD }}
+        run: |
+          # Fail fast with a clear message. Values are never echoed.
+          set -euo pipefail
+          missing=0
+          for name in SSH_PRIVATE_KEY STAGING_HOST STAGING_USER STAGING_E2E_PASSWORD STAGING_ADMIN_PASSWORD; do
+            # Indirect expansion: the NAME is fixed, the value is never printed.
+            eval "v=\${$name:-}"
+            if [ -z "$v" ]; then
+              echo "::error::Required staging secret for ${name} is not set (see this workflow's header for the secret names it maps from)."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+      # Identical to the 'Configure SSH for the staging host' step in
+      # deploy-staging.yml — same allowlist validation, same known_hosts pin,
+      # same `install -m 600` key write, BatchMode, no set -x.
+      - name: Configure SSH for the staging host
+        timeout-minutes: 2
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+          STAGING_USER: ${{ secrets.STAGING_USER }}
+          STAGING_KNOWN_HOSTS: ${{ secrets.STAGING_KNOWN_HOSTS }}
+          SSH_PORT: ${{ vars.STAGING_SSH_PORT || '22' }}
+        run: |
+          # NOTE: never add `set -x` here - this step handles the deploy key.
+          set -euo pipefail
+
+          # ssh_config is a CONFIG FILE, not a shell: a newline inside a value
+          # starts a NEW DIRECTIVE (ProxyCommand is the dangerous one - it runs
+          # on the runner, which holds the deploy key, on every later ssh call).
+          # Validate BEFORE anything is written. See deploy-staging.yml's header
+          # for the full threat model.
+          case "${SSH_PORT}" in
+            '')
+              echo "::error::STAGING_SSH_PORT is set to an empty value. Set it to a TCP port number (1-65535), or unset the variable to use the default 22."
+              exit 1
+              ;;
+            *[!0-9]*)
+              echo "::error::STAGING_SSH_PORT must be digits only - a TCP port number (length ${#SSH_PORT}). Refusing to write it into ~/.ssh/config."
+              exit 1
+              ;;
+          esac
+          if [ "${#SSH_PORT}" -gt 5 ]; then
+            echo "::error::STAGING_SSH_PORT is ${#SSH_PORT} digits long; a TCP port has at most 5 (1-65535)."
+            exit 1
+          fi
+          case "${SSH_PORT}" in
+            0[0-9]*)
+              echo "::error::STAGING_SSH_PORT=${SSH_PORT} has a leading zero. Write it as a plain decimal port (08080 -> 8080)."
+              exit 1
+              ;;
+          esac
+          if [ "${SSH_PORT}" -lt 1 ] || [ "${SSH_PORT}" -gt 65535 ]; then
+            echo "::error::STAGING_SSH_PORT=${SSH_PORT} is outside the valid TCP port range 1-65535."
+            exit 1
+          fi
+
+          case "${STAGING_HOST}" in
+            *$'\n'* | *$'\r'*)
+              echo "::error::Secret STAGING_HOST contains a line break, which would start a new directive in ~/.ssh/config. Re-set the secret to a single-line host name or IP address."
+              exit 1
+              ;;
+            [[:space:]]* | *[[:space:]])
+              echo "::error::Secret STAGING_HOST has leading or trailing whitespace (invisible in the GitHub UI). Remove it and re-set the secret."
+              exit 1
+              ;;
+          esac
+          case "${STAGING_USER}" in
+            *$'\n'* | *$'\r'*)
+              echo "::error::Secret STAGING_USER contains a line break, which would start a new directive in ~/.ssh/config. Re-set the secret to a single-line user name."
+              exit 1
+              ;;
+            [[:space:]]* | *[[:space:]])
+              echo "::error::Secret STAGING_USER has leading or trailing whitespace (invisible in the GitHub UI). Remove it and re-set the secret."
+              exit 1
+              ;;
+          esac
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # `install -m 600` creates the key file already 0600 - never readable
+          # by anyone else, not even for an instant.
+          install -m 600 /dev/stdin ~/.ssh/roomflow_staging_deploy <<<"${SSH_PRIVATE_KEY}"
+          unset SSH_PRIVATE_KEY
+
+          # Host-key trust: STAGING_KNOWN_HOSTS pins the host key (covers
+          # [host]:port for ed25519+ecdsa+rsa); without it, fall back to
+          # accept-new (TOFU) with a warning - same trade-off as deploy-staging.yml.
+          if [ -n "${STAGING_KNOWN_HOSTS}" ]; then
+            printf '%s\n' "${STAGING_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+            STRICT_HOST_KEY_CHECKING="yes"
+          else
+            : > ~/.ssh/known_hosts
+            STRICT_HOST_KEY_CHECKING="accept-new"
+            echo "::warning::STAGING_KNOWN_HOSTS is not set; falling back to StrictHostKeyChecking=accept-new (trust on first use)."
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          cat > ~/.ssh/config <<EOF
+          Host roomflow-staging
+            HostName ${STAGING_HOST}
+            User ${STAGING_USER}
+            Port ${SSH_PORT}
+            IdentityFile ~/.ssh/roomflow_staging_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking ${STRICT_HOST_KEY_CHECKING}
+            UserKnownHostsFile ~/.ssh/known_hosts
+            BatchMode yes
+            ConnectTimeout 15
+            ServerAliveInterval 30
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Open the SSH tunnel and wait for the staging frontend
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          # Local forward only; -N = no remote command, BatchMode (from the
+          # config) means a failure cannot hang on a prompt.
+          ssh -N -L 8081:127.0.0.1:8081 roomflow-staging &
+          echo "SSH_TUNNEL_PID=$!" >> "$GITHUB_ENV"
+
+          # Readiness: the SPA must answer AND /api/ must reach the backend
+          # through the tunnel (an unauthenticated /api/auth/me returns 401,
+          # which is the proof the proxy chain is alive - any 5xx or a timeout
+          # is not).
+          ok=""
+          for i in $(seq 1 30); do
+            code_ui="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/ || true)"
+            code_api="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/api/auth/me || true)"
+            if [ "${code_ui}" = "200" ] && [ "${code_api}" = "401" ]; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "${ok}" ]; then
+            echo "::error::Staging frontend did not become reachable through the tunnel (last UI status '${code_ui:-none}', API status '${code_api:-none}')."
+            exit 1
+          fi
+          echo "Staging stack reachable through the tunnel (UI 200, API 401 as expected)."
+
+      - name: Run the staging E2E suite
+        working-directory: frontend
+        timeout-minutes: 65
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:8081
+          STAGING_E2E_PASSWORD: ${{ secrets.STAGING_E2E_PASSWORD }}
+          STAGING_ADMIN_PASSWORD: ${{ secrets.STAGING_ADMIN_PASSWORD }}
+        run: npm run test:e2e:staging
+
+      - name: Close the SSH tunnel
+        if: always()
+        timeout-minutes: 1
+        run: |
+          # Best-effort; the runner is torn down anyway. `if: always()` so the
+          # forward is not left running after a test failure.
+          if [ -n "${SSH_TUNNEL_PID:-}" ]; then
+            kill "${SSH_TUNNEL_PID}" 2>/dev/null || true
+          fi
+
+      - name: Upload Playwright results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 3
+        with:
+          name: e2e-staging-results
+          # trace/video are disabled for the staging project (they can capture
+          # typed credentials); this is the junit/html report + failure
+          # screenshots only.
+          path: frontend/test-results
+          if-no-files-found: ignore

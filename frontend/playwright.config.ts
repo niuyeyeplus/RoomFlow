@@ -11,7 +11,7 @@ import { defineConfig, devices } from '@playwright/test'
 //     UI  base: E2E_BASE_URL     -> http://localhost:5173   (Vite dev server)
 //     API base: E2E_API_BASE_URL -> http://localhost:8080   (tests/e2e/helpers.ts)
 //
-//   staging - the `staging` project, i.e. staging-smoke.spec.ts only
+//   staging - the `staging` project, i.e. every staging-*.spec.ts file
 //     UI  base: PLAYWRIGHT_BASE_URL -> STAGING_BASE_URL
 //     API base: STAGING_API_BASE_URL -> the staging UI URL  (same origin)
 //
@@ -90,8 +90,8 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      // The staging smoke spec belongs to the `staging` project only, so a
-      // default (no staging env) run never even collects it.
+      // The staging specs belong to the `staging` project only, so a
+      // default (no staging env) run never even collects them.
       testIgnore: /staging-smoke\.spec\.ts/,
       // Inherits the dev `use.baseURL` above; it must never see a staging URL.
       use: { ...devices['Desktop Chrome'] }
@@ -101,12 +101,24 @@ export default defineConfig({
       ? [
           {
             name: 'staging',
-            testMatch: /staging-smoke\.spec\.ts/,
+            testMatch: /staging-.*\.spec\.ts/,
             // The staging specs hit one real shared database; keep the run serial.
             fullyParallel: false,
             workers: 1,
             // Rule 1: the staging URL is scoped to THIS project, not global.
-            use: { ...devices['Desktop Chrome'], baseURL: stagingURL }
+            // trace/video are OFF here on purpose: the staging specs type real,
+            // env-supplied credentials, and Playwright traces capture DOM state
+            // (including input values) while videos/artifacts are uploaded to CI.
+            // A retained artifact could carry a credential to anyone who can
+            // download run artifacts, so staging failures are debugged from
+            // screenshots + the junit/html report only.
+            use: {
+              ...devices['Desktop Chrome'],
+              baseURL: stagingURL,
+              trace: 'off',
+              video: 'off',
+              screenshot: 'only-on-failure'
+            }
           }
         ]
       : [])
