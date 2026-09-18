@@ -30,7 +30,12 @@
 # .github/scripts on the runner) and load the shared library from there.
 _PROD_LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=/dev/null
-. "${_PROD_LIB_DIR}/staging-deploy-lib.sh"
+# `|| return 1` matters: this file is itself sourced inside callers' `if !`
+# context, where a failed inner `.` would otherwise be swallowed and the outer
+# source would still succeed (the last statement is a function definition),
+# surfacing later as a misleading `command not found` instead of "deploy
+# library missing".
+. "${_PROD_LIB_DIR}/staging-deploy-lib.sh" || return 1
 unset _PROD_LIB_DIR
 
 # ---------------------------------------------------------------------------

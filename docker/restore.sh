@@ -136,9 +136,19 @@ if ! gzip -t "${BACKUP_FILE}" 2>/dev/null; then
 fi
 
 # --- is the database running? -------------------------------------------------
-RUNNING="$(docker inspect --format '{{.State.Running}}' "${MYSQL_CONTAINER}" 2>/dev/null || true)"
+# Same disambiguation as backup.sh: `docker inspect` fails for a missing
+# container AND for an unreachable daemon; a restore must fail closed either
+# way, but the message should say which happened.
+if ! RUNNING="$(docker inspect --format '{{.State.Running}}' "${MYSQL_CONTAINER}" 2>/dev/null)"; then
+  if docker info >/dev/null 2>&1; then
+    echo "ERROR: database container '${MYSQL_CONTAINER}' does not exist; cannot restore." >&2
+  else
+    echo "ERROR: cannot inspect '${MYSQL_CONTAINER}' and the docker daemon is unreachable (or the caller lacks docker permission)." >&2
+  fi
+  exit 3
+fi
 if [ "${RUNNING}" != "true" ]; then
-  echo "ERROR: database container '${MYSQL_CONTAINER}' is not running; cannot restore." >&2
+  echo "ERROR: database container '${MYSQL_CONTAINER}' exists but is not running; cannot restore." >&2
   exit 3
 fi
 
@@ -148,7 +158,10 @@ fi
 # itself reversible. It lands in BACKUP_DIR like every other dump.
 if [ "${TARGET_DB}" = "${DB_NAME}" ]; then
   echo "Taking a pre-restore safety dump of the current '${DB_NAME}' first..."
-  if ! bash "${DEPLOY_DIR}/backup.sh" "${DEPLOY_DIR}" "${ENV_FILE_OVERRIDE}"; then
+  # MYSQL_CONTAINER is passed explicitly: it is a plain (unexported) variable,
+  # so without this the child backup.sh would dump the DEFAULT container while
+  # we restore into the overridden one.
+  if ! MYSQL_CONTAINER="${MYSQL_CONTAINER}" bash "${DEPLOY_DIR}/backup.sh" "${DEPLOY_DIR}" "${ENV_FILE_OVERRIDE}"; then
     echo "ERROR: pre-restore safety dump failed; refusing to proceed." >&2
     exit 2
   fi
@@ -157,6 +170,19 @@ fi
 # --- stop the backend so nothing writes during the restore -------------------
 BACKEND_CONTAINER="${MYSQL_CONTAINER%-mysql}-backend"
 BACKEND_WAS_RUNNING='no'
+# If the script dies by signal between `docker stop` and the restart, the
+# backend must not be left down: the EXIT trap restarts it whenever it was
+# running and has not been restarted yet. Handled error paths clear the flag
+# first so the trap is a no-op on the normal exits.
+restore_backend_on_exit() {
+  if [ "${BACKEND_WAS_RUNNING}" = 'yes' ]; then
+    echo "restore.sh: caught an exit while the backend was stopped - restarting '${BACKEND_CONTAINER}'." >&2
+    docker start "${BACKEND_CONTAINER}" >/dev/null 2>&1 || \
+      echo "restore.sh: WARNING - could not restart '${BACKEND_CONTAINER}'; start it manually." >&2
+  fi
+}
+trap restore_backend_on_exit EXIT
+
 if [ "${SKIP_BACKEND_STOP}" != "yes" ]; then
   BR="$(docker inspect --format '{{.State.Running}}' "${BACKEND_CONTAINER}" 2>/dev/null || true)"
   if [ "${BR}" = "true" ]; then
@@ -172,7 +198,10 @@ if ! docker exec "${MYSQL_CONTAINER}" sh -c \
     'exec mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$1\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"' \
     _ "${TARGET_DB}"; then
   echo "ERROR: could not create target database '${TARGET_DB}'." >&2
-  [ "${BACKEND_WAS_RUNNING}" = 'yes' ] && docker start "${BACKEND_CONTAINER}" >/dev/null || true
+  if [ "${BACKEND_WAS_RUNNING}" = 'yes' ]; then
+    docker start "${BACKEND_CONTAINER}" >/dev/null || true
+    BACKEND_WAS_RUNNING='no'
+  fi
   exit 2
 fi
 
@@ -182,13 +211,17 @@ if ! gzip -dc "${BACKUP_FILE}" | docker exec -i "${MYSQL_CONTAINER}" sh -c \
     _ "${TARGET_DB}"; then
   echo "ERROR: mysql replay FAILED partway; '${TARGET_DB}' may be partially restored." >&2
   echo "       The pre-restore safety dump (if taken) is in BACKUP_DIR." >&2
-  [ "${BACKEND_WAS_RUNNING}" = 'yes' ] && docker start "${BACKEND_CONTAINER}" >/dev/null || true
+  if [ "${BACKEND_WAS_RUNNING}" = 'yes' ]; then
+    docker start "${BACKEND_CONTAINER}" >/dev/null || true
+    BACKEND_WAS_RUNNING='no'
+  fi
   exit 2
 fi
 
 if [ "${BACKEND_WAS_RUNNING}" = 'yes' ]; then
   echo "Starting backend container '${BACKEND_CONTAINER}'..."
   docker start "${BACKEND_CONTAINER}" >/dev/null
+  BACKEND_WAS_RUNNING='no'
 fi
 
 echo "Restore into '${TARGET_DB}' complete."

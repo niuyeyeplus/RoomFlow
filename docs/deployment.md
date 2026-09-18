@@ -1697,6 +1697,36 @@ production resource** — the prod stack itself was never started:
    approval → the run itself performs backup → deploy → health check →
    rollback-if-needed.
 
+**First deploy attempt record (2026-09-17, run `35249529519`):** the dispatch
+for tag `36696da5e18b6c579f8a9fc3a7a2e72ca4aa73b7` was approved at the
+`production` environment gate, then failed at the artifact-ship step —
+`mkdir -p /opt/roomflow/production` returned `Permission denied` because
+`/opt/roomflow` is root-owned and the deploy dir had not been provisioned
+(prerequisite 2 above). The backup, deploy and health steps never ran; the
+diagnostics step confirmed no `roomflow-prod-*` resources exist. The host-side
+fix is `sudo install -d -o deploy -g docker -m 2770 /opt/roomflow/production`
+followed by `.env.production` per §11.3.
+
+The failure also drove a hardening pass over the whole slice (expert review
+confirmed no other blocking defect):
+
+* the ship step now fails with the actionable prerequisite message above
+  instead of a bare `Permission denied`;
+* the pre-deploy backup step propagates `backup.sh` exit 3 verbatim so the
+  run summary reports "skipped — no running database (first deploy)" instead
+  of falsely claiming a verified dump exists;
+* `backup.sh` treats an unreachable docker daemon differently from a missing
+  container (it refuses rather than deploying without a restore point) and
+  reports an actionable error when `BACKUP_DIR` cannot be created;
+* `restore.sh` disambiguates the same inspect failure, restarts the backend
+  on signal via an `EXIT` trap, and propagates `MYSQL_CONTAINER` to the
+  pre-restore safety dump;
+* `image_tag` is additionally verified to be a `main`-lineage commit
+  (compare API), so a feature-branch SHA carrying modified deploy scripts
+  cannot be dispatched to the production host;
+* the rollback condition now also fires when the health-check step is
+  cancelled mid-probe.
+
 **Until then: no automatic or agent-initiated production deploy.** TLS, the
 public domain, and any scheduled-backup cron remain operator decisions outside
 this slice.

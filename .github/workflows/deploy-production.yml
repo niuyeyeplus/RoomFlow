@@ -148,6 +148,7 @@ jobs:
         timeout-minutes: 2
         env:
           DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -175,6 +176,31 @@ jobs:
             echo "::error::image_tag must be the full 40-character commit SHA (got ${#RAW_TAG} characters). We never shorten the tag: the full SHA is what makes the deploy immutable."
             exit 1
           fi
+
+          # GATE 3 - main lineage. The environment's "deployment branches:
+          # main" rule constrains the REF the run is dispatched from, NOT the
+          # image_tag input: a write-access user could otherwise pass a
+          # feature-branch SHA carrying modified deploy scripts, and the
+          # shipped remote scripts would run on the production host as the
+          # deploy user. The deployed revision must therefore be a commit
+          # already merged into main. compare/main...<tag> reports how <tag>
+          # relates to main: 'behind' = it is an ancestor (merged), 'identical'
+          # = it IS the main tip; anything else ('ahead' = unmerged branch,
+          # 'diverged') is refused. GH_TOKEN + contents:read suffices for the
+          # compare endpoint.
+          if ! MERGE_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${RAW_TAG}" --jq .status 2>/dev/null)"; then
+            echo "::error::Could not resolve image_tag ${RAW_TAG} against main via the compare API. It must be a commit that exists in this repository (a full 40-hex SHA that is not in the repo passes the format gates but cannot be deployed)."
+            exit 1
+          fi
+          case "${MERGE_STATE}" in
+            behind | identical)
+              echo "image_tag is a main-lineage commit (compare status: ${MERGE_STATE})."
+              ;;
+            *)
+              echo "::error::image_tag ${RAW_TAG} is not a commit merged into main (compare status: ${MERGE_STATE:-unknown}). Production deploys only accept main-lineage SHAs - deploy the merge commit, not a feature-branch head."
+              exit 1
+              ;;
+          esac
 
           # SAFE: proven exactly 40 lowercase hex characters, so it cannot
           # contain a newline or append a second output key.
@@ -402,7 +428,18 @@ jobs:
 
           # PROD_DEPLOY_DIR was proven to match ^/[A-Za-z0-9._/-]+$ by the
           # "Validate deployment configuration" step.
-          ssh roomflow-production mkdir -p "${PROD_DEPLOY_DIR}"
+          #
+          # The deploy dir is a HOST PREREQUISITE (see the header and
+          # docs/deployment.md section 11.3): it must already exist and be
+          # owned by the SSH user. `mkdir -p` is a no-op then, but on a
+          # not-yet-provisioned host it fails with a bare "Permission denied"
+          # that names neither the cause nor the fix — seen live on the first
+          # production deploy attempt. Fail here with the actionable
+          # instruction instead of letting each scp fail one file at a time.
+          if ! ssh roomflow-production mkdir -p "${PROD_DEPLOY_DIR}"; then
+            echo "::error::Cannot create the deploy dir ${PROD_DEPLOY_DIR} on the production host (mkdir -p failed). This directory is a host prerequisite, not something the workflow provisions: on the host, as root or with sudo, run 'install -d -o <PROD_USER> -g docker -m 2770 ${PROD_DEPLOY_DIR}' (matching the staging dir's deploy:docker 2770 layout), then place .env.production there per docs/deployment.md section 11.3 and re-run."
+            exit 1
+          fi
           scp -q docker/docker-compose.prod.yml "roomflow-production:${PROD_DEPLOY_DIR}/docker-compose.prod.yml"
           scp -q docker/health-check.sh "roomflow-production:${PROD_DEPLOY_DIR}/health-check.sh"
           scp -q docker/backup.sh "roomflow-production:${PROD_DEPLOY_DIR}/backup.sh"
@@ -449,17 +486,23 @@ jobs:
               ;;
             *)
               echo "ERROR: pre-deploy backup failed (backup.sh exit ${RC}). Refusing to deploy without a restore point." >&2
-              exit "${RC}"
               ;;
           esac
-          exit 0
+          # Propagate the code verbatim so the Report step can tell "a dump was
+          # written" (0) from "nothing existed to dump" (3) — flattening 3 to 0
+          # here would make the summary claim a restore point that does not
+          # exist on a first deploy.
+          exit "${RC}"
           REMOTE_BACKUP
           RC=$?
           set -e
 
           echo "rc=${RC}" >> "$GITHUB_OUTPUT"
           echo "Pre-deploy backup exit code: ${RC}"
-          exit "${RC}"
+          case "${RC}" in
+            0 | 3) exit 0 ;;
+            *) exit "${RC}" ;;
+          esac
 
       # ---------------------------------------------------------------------
       # 7. Registry auth on the host - ONLY when a credential exists (the
@@ -653,6 +696,7 @@ jobs:
           ((steps.deploy.outcome == 'failure' && steps.deploy.outputs.rc != '1') ||
            steps.deploy.outcome == 'cancelled' ||
            (steps.healthcheck.outcome == 'failure' && steps.healthcheck.outputs.result == '') ||
+           steps.healthcheck.outcome == 'cancelled' ||
            steps.healthcheck.outputs.result == 'unhealthy' ||
            steps.healthcheck.outputs.result == 'unknown')
         continue-on-error: true
