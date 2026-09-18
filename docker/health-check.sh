@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 #
-# RoomFlow post-deploy health check for the STAGING stack.
+# RoomFlow post-deploy health check for the STAGING stack — and, with explicit
+# URL arguments, for the PRODUCTION stack: deploy-production.yml invokes it as
+# `health-check.sh <backend_url> <frontend_url>` with both URLs resolved from
+# the production env file, so the STAGING_*_PORT defaults below are staging-only
+# fallbacks. A bare run on the production host would probe the staging ports;
+# that fails closed (reports unhealthy), it cannot pass a stack that is not
+# there.
 #
 # Runs against the two loopback-bound HTTP endpoints published by
 # docker/docker-compose.staging.yml:

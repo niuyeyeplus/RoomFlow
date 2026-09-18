@@ -91,13 +91,36 @@ case "${MYSQL_CONTAINER}" in
 esac
 
 # --- is there a running database? -------------------------------------------
-RUNNING="$(docker inspect --format '{{.State.Running}}' "${MYSQL_CONTAINER}" 2>/dev/null || true)"
+# `docker inspect` fails BOTH when the container does not exist AND when the
+# daemon is unreachable or the caller lacks docker permission. Treating the
+# second case as "first deploy, nothing to back up" would let a deploy proceed
+# WITHOUT a restore point over a live database — the exact risk this script
+# exists to remove. Disambiguate with `docker info`: daemon reachable + no
+# container = first deploy (rc 3); daemon unreachable = refuse (rc 2).
+if ! RUNNING="$(docker inspect --format '{{.State.Running}}' "${MYSQL_CONTAINER}" 2>/dev/null)"; then
+  if docker info >/dev/null 2>&1; then
+    echo "No database container '${MYSQL_CONTAINER}' — nothing to back up (expected on a first deploy)."
+    exit 3
+  fi
+  echo "ERROR: cannot inspect '${MYSQL_CONTAINER}' and the docker daemon is unreachable (or the caller lacks docker permission). Refusing to assume there is nothing to back up." >&2
+  exit 2
+fi
 if [ "${RUNNING}" != "true" ]; then
-  echo "No running database container '${MYSQL_CONTAINER}' — nothing to back up (expected on a first deploy)."
+  echo "Database container '${MYSQL_CONTAINER}' exists but is not running — nothing to back up."
   exit 3
 fi
 
-mkdir -p "${BACKUP_DIR}"
+# The backup dir is a HOST PREREQUISITE like the deploy dir: on an
+# unprovisioned host `mkdir -p` fails with a bare 'Permission denied' that
+# names neither the cause nor the fix (seen live with the deploy dir on the
+# first production deploy attempt). Emit the actionable instruction instead.
+if ! mkdir -p "${BACKUP_DIR}" 2>/dev/null; then
+  echo "ERROR: cannot create BACKUP_DIR ${BACKUP_DIR} (mkdir -p failed - the parent tree is not writable by this user)." >&2
+  echo "       It is a host prerequisite: on the host, as root or with sudo, run" >&2
+  echo "         install -d -o <deploy user> -g docker -m 700 ${BACKUP_DIR}" >&2
+  echo "       then re-run. See docs/deployment.md section 11.3." >&2
+  exit 1
+fi
 chmod 700 "${BACKUP_DIR}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
